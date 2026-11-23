@@ -1,0 +1,6 @@
+{
+  "name": "ColdChain CMS",
+  "description": "Real-time cold-chain fleet telemetry command center with indexed SQLite query optimization and live WebSocket streaming.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

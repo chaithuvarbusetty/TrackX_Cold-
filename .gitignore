@@ -1,0 +1,42 @@
+# Environments & Secrets
+.env
+.env.*
+!.env.example
+*.pem
+PUBLIC_URL.txt
+
+# Executables & Binaries
+*.exe
+ngrok.exe
+ngrok
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+env/
+venv/
+ENV/
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+backend.log
+tunnel.log
+
+# Frontend & Node
+node_modules/
+Frontend/node_modules/
+Frontend/dist/
+
+# IDE & OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

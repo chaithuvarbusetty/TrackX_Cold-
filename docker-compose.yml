@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: timescale/timescaledb:latest-pg16
+    container_name: tracx_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: coldchain
+      POSTGRES_PASSWORD: coldchain_secret
+      POSTGRES_DB: coldchain_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./backend/database/schema_postgres.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coldchain -d coldchain_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
+    driver: local
