@@ -28,6 +28,7 @@ import {
   VehicleCargoBadge,
 } from './CargoShell';
 import { LiveOscilloscopeChart, MiniSparkline } from './RealtimeCharts';
+import { Viewport3D } from './LazyViewport3D';
 
 interface VehicleReadingsPageProps {
   fleetRows: FleetTableRow[];
@@ -218,6 +219,37 @@ export const VehicleReadingsPage: React.FC<VehicleReadingsPageProps> = ({
   const selectedStage = selectedRow
     ? evaluateVehicleThermalFlow(selectedRow).stage
     : 'OPTIMAL';
+
+  const diagnosticTelemetry = useMemo(() => {
+    if (!selectedRow) return undefined;
+    const rawTemp = selectedRow.current_temp_c;
+    const temp =
+      rawTemp !== null && rawTemp !== undefined && !isNaN(Number(rawTemp))
+        ? Number(rawTemp)
+        : 29.0;
+    const minT = selectedRow.target_min_c ?? 2.0;
+    const maxT = selectedRow.target_max_c ?? 8.0;
+    const tempBand =
+      temp > maxT ? 'above_critical' : temp < minT ? 'below_critical' : 'optimal';
+    const isAlert =
+      selectedRow.status === 'EXCURSION' ||
+      temp > maxT ||
+      selectedRow.security === 'OPEN';
+    return {
+      callsign: selectedRow.device_id,
+      temperatureC: temp,
+      tempBand: tempBand as 'optimal' | 'above_critical' | 'below_critical',
+      doorState: (selectedRow.security === 'OPEN' ? 'open' : 'closed') as 'open' | 'closed',
+      compressorActive: selectedRow.compressor_active ?? true,
+      speedKmh: selectedRow.speed_kmh != null ? Number(selectedRow.speed_kmh) : 0,
+      vehicleMoving: (selectedRow.speed_kmh ?? 0) > 1.0,
+      isAlertActive: isAlert,
+      isDoorTampered: selectedRow.security === 'OPEN',
+      accentHex: 0x2563eb,
+      cutawayEnabled: false,
+      cameraPreset: 'doors' as const,
+    };
+  }, [selectedRow]);
 
   return (
     <div className="space-y-6">
@@ -600,6 +632,31 @@ export const VehicleReadingsPage: React.FC<VehicleReadingsPageProps> = ({
                   {selectedRow.speed_kmh.toFixed(1)} km/h
                 </div>
               </div>
+            </div>
+
+            {/* Hardware Diagnostic & Action Twin */}
+            <div className="space-y-3 rounded-xl border border-slate-200 bg-slate-50/60 p-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h3 className="font-display text-sm font-bold text-slate-900">
+                    Hardware Diagnostic &amp; Action Twin ({selectedRow.device_id})
+                  </h3>
+                  <p className="text-xs text-slate-500">
+                    Real-time physical telemetry twin responding to compressor, door breach, and sensor simulation controls
+                  </p>
+                </div>
+                <span className="font-mono text-xs font-semibold text-blue-700">
+                  Diagnostic Mode · Rear Doors Preset
+                </span>
+              </div>
+
+              <Viewport3D
+                mode="diagnostic"
+                telemetry={diagnosticTelemetry}
+                heightClass="h-[360px]"
+                onHardwareAction={(act) => handleSim(act as SimulationActionType)}
+                onDoorClick={() => handleSim('DOOR_BREACH')}
+              />
             </div>
 
             <LiveOscilloscopeChart

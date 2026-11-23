@@ -228,15 +228,17 @@ export const AiForecastChart: React.FC<{
   forecast: TemperatureForecast;
   targetMaxC: number;
 }> = ({ recentTemps, forecast, targetMaxC }) => {
-  const actual = recentTemps.length > 0 ? recentTemps.slice(-8) : [forecast.current_temp_c];
-  const projected = forecast.baseline_ready
+  const fallbackTemp = forecast.current_temp_c != null ? forecast.current_temp_c : 29.0;
+  const actual: number[] = recentTemps.length > 0 ? recentTemps.slice(-8) : [fallbackTemp];
+  const projected: number[] = (forecast.baseline_ready
     ? [
         actual[actual.length - 1],
-        forecast.predicted_15m_c ?? forecast.current_temp_c,
-        forecast.predicted_30m_c ?? forecast.current_temp_c,
-        forecast.predicted_60m_c ?? forecast.current_temp_c,
+        forecast.predicted_15m_c ?? fallbackTemp,
+        forecast.predicted_30m_c ?? fallbackTemp,
+        forecast.predicted_60m_c ?? fallbackTemp,
       ]
-    : [actual[actual.length - 1]];
+    : [actual[actual.length - 1]]
+  ).filter((v): v is number => v !== null && v !== undefined && !isNaN(Number(v)));
 
   const allVals = [...actual, ...projected, targetMaxC, 2];
   const minVal = Math.min(...allVals) - 0.8;

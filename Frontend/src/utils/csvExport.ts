@@ -47,7 +47,7 @@ export function buildTelemetryCsv(points: TelemetryPoint[]): string {
         p.device_id,
         p.node_id,
         p.timestamp,
-        p.cargo_temp_c.toFixed(2),
+        p.cargo_temp_c != null ? p.cargo_temp_c.toFixed(2) : '',
         p.ambient_temp_c.toFixed(1),
         p.humidity_pct.toFixed(1),
         p.lat.toFixed(6),

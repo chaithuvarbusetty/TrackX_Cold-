@@ -104,10 +104,12 @@ export class TelemetryEngine {
         anchorLat: row?.lat ?? 17.4483,
         anchorLng: row?.lng ?? 78.3915,
         batteryPct: latest?.battery_pct ?? 94,
-        recentSamples: history.map((h) => ({
-          recorded_at_ms: h.recorded_at_ms,
-          cargo_temp_c: h.cargo_temp_c,
-        })),
+        recentSamples: history
+          .filter((h) => h.cargo_temp_c != null)
+          .map((h) => ({
+            recorded_at_ms: h.recorded_at_ms,
+            cargo_temp_c: h.cargo_temp_c as number,
+          })),
         lastPacket: latest,
       });
     }

@@ -40,3 +40,11 @@ Frontend/dist/
 Thumbs.db
 .vscode/
 .idea/
+
+# Playwright Test Artifacts
+playwright-report/
+test-results/
+Frontend/playwright-report/
+Frontend/test-results/
+.last-run.json
+

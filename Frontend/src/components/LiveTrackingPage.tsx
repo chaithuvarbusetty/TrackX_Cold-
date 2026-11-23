@@ -1,5 +1,5 @@
-import React, { useEffect, useState } from 'react';
-import { ArrowUpRight, Download, Navigation } from 'lucide-react';
+import React, { useEffect, useMemo, useState } from 'react';
+import { ArrowUpRight, Box, Download, Navigation } from 'lucide-react';
 import type {
   DailyTripLeg,
   FleetOverviewPayload,
@@ -9,6 +9,7 @@ import type {
 } from '../shared/types';
 import { getVehicleCargoProfile, type VehicleBodyType } from '../utils/vehicleCargo';
 import { LiveFleetMap } from './LiveFleetMap';
+import { Viewport3D } from './LazyViewport3D';
 import {
   CargoHeroBanner,
   SignalStrengthDisplay,
@@ -69,7 +70,35 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
   const focused: FleetTableRow | undefined =
     fleet_table.find((r) => r.device_id === selectedDeviceId) ?? fleet_table[0];
 
+  const [viewMode, setViewMode] = useState<'map' | '3d' | 'split'>('map');
   const [dailyLegs, setDailyLegs] = useState<DailyTripLeg[]>([]);
+
+  const liveTelemetry = useMemo(() => {
+    if (!focused) return undefined;
+    const temp =
+      focused.current_temp_c != null && !isNaN(Number(focused.current_temp_c))
+        ? Number(focused.current_temp_c)
+        : 29.0;
+    const maxT = focused.target_max_c ?? 8.0;
+    const minT = focused.target_min_c ?? 2.0;
+    const tempBand =
+      temp > maxT ? 'above_critical' : temp < minT ? 'below_critical' : 'optimal';
+    const isAlert =
+      focused.status === 'EXCURSION' || temp > maxT || focused.security === 'OPEN';
+    return {
+      callsign: focused.device_id,
+      temperatureC: temp,
+      tempBand: tempBand as 'optimal' | 'above_critical' | 'below_critical',
+      doorState: (focused.security === 'OPEN' ? 'open' : 'closed') as 'open' | 'closed',
+      compressorActive: focused.compressor_active ?? true,
+      speedKmh: focused.speed_kmh != null ? Number(focused.speed_kmh) : 0,
+      vehicleMoving: (focused.speed_kmh ?? 0) > 1.0,
+      isAlertActive: isAlert,
+      isDoorTampered: focused.security === 'OPEN',
+      accentHex: 0x2563eb,
+      cutawayEnabled: false,
+    };
+  }, [focused]);
 
   useEffect(() => {
     if (!selectedDeviceId) return;
@@ -143,24 +172,100 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                 Each marker shows vehicle body type, transported item, and live chamber temperature
               </p>
             </div>
-            <div className="flex items-center gap-3 text-xs font-medium text-slate-600">
-              <span className="text-emerald-700">Optimal (&lt;7.0°C)</span>
-              <span aria-hidden="true">·</span>
-              <span className="text-amber-600">Warning (≥7.0°C)</span>
-              <span aria-hidden="true">·</span>
-              <span className="text-rose-600">Critical (&gt;8.0°C)</span>
+
+            <div className="flex flex-wrap items-center gap-2">
+              {/* View Toggle Buttons */}
+              <div
+                role="group"
+                aria-label="Corridor visualization modes"
+                className="flex items-center rounded-lg border border-slate-300 bg-slate-100 p-0.5 text-xs font-semibold"
+              >
+                <button
+                  type="button"
+                  onClick={() => setViewMode('map')}
+                  aria-pressed={viewMode === 'map'}
+                  className={`min-h-[44px] min-w-[44px] sm:min-h-0 sm:min-w-0 rounded-md px-3 py-1.5 transition-colors cursor-pointer ${
+                    viewMode === 'map'
+                      ? 'bg-white text-slate-900 shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  2D Map
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setViewMode('3d')}
+                  aria-pressed={viewMode === '3d'}
+                  className={`min-h-[44px] min-w-[44px] sm:min-h-0 sm:min-w-0 rounded-md px-3 py-1.5 transition-colors cursor-pointer ${
+                    viewMode === '3d'
+                      ? 'bg-white text-blue-700 shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  3D Live Rig
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setViewMode('split')}
+                  aria-pressed={viewMode === 'split'}
+                  className={`min-h-[44px] min-w-[44px] sm:min-h-0 sm:min-w-0 rounded-md px-3 py-1.5 transition-colors cursor-pointer ${
+                    viewMode === 'split'
+                      ? 'bg-white text-blue-700 shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  Split View
+                </button>
+              </div>
+
+              <div className="hidden sm:flex items-center gap-2 text-xs font-medium text-slate-600 pl-2">
+                <span className="text-emerald-700">Optimal (&lt;7.0°C)</span>
+                <span aria-hidden="true">·</span>
+                <span className="text-amber-600">Warn (≥7.0°C)</span>
+                <span aria-hidden="true">·</span>
+                <span className="text-rose-600">Crit (&gt;8.0°C)</span>
+              </div>
             </div>
           </div>
 
-          <LiveFleetMap
-            mode="overview"
-            fleetRows={fleet_table}
-            selectedDeviceId={selectedDeviceId}
-            onSelectDevice={onSelectDevice}
-            geofences={geofences}
-            dailyLegs={dailyLegs}
-            heightClass="h-[395px]"
-          />
+          {viewMode === 'map' && (
+            <LiveFleetMap
+              mode="overview"
+              fleetRows={fleet_table}
+              selectedDeviceId={selectedDeviceId}
+              onSelectDevice={onSelectDevice}
+              geofences={geofences}
+              dailyLegs={dailyLegs}
+              heightClass="h-[395px]"
+            />
+          )}
+
+          {viewMode === '3d' && (
+            <Viewport3D
+              mode="live"
+              telemetry={liveTelemetry}
+              heightClass="h-[395px]"
+            />
+          )}
+
+          {viewMode === 'split' && (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <LiveFleetMap
+                mode="overview"
+                fleetRows={fleet_table}
+                selectedDeviceId={selectedDeviceId}
+                onSelectDevice={onSelectDevice}
+                geofences={geofences}
+                dailyLegs={dailyLegs}
+                heightClass="h-[395px]"
+              />
+              <Viewport3D
+                mode="live"
+                telemetry={liveTelemetry}
+                heightClass="h-[395px]"
+              />
+            </div>
+          )}
 
           {dailyLegs.length > 0 && (
             <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-lg border border-slate-200 bg-slate-50/80 px-3 py-2 text-xs">

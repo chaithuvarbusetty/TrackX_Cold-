@@ -409,10 +409,13 @@ export default function App() {
   );
 
   const activeForecast = useMemo(() => {
-    const samples = selectedHistory.slice(-12).map((h) => ({
-      recorded_at_ms: h.recorded_at_ms,
-      cargo_temp_c: h.cargo_temp_c,
-    }));
+    const samples = selectedHistory
+      .slice(-12)
+      .filter((h): h is typeof h & { cargo_temp_c: number } => h.cargo_temp_c != null && !isNaN(Number(h.cargo_temp_c)))
+      .map((h) => ({
+        recorded_at_ms: h.recorded_at_ms,
+        cargo_temp_c: Number(h.cargo_temp_c),
+      }));
     return computeClientForecast(
       samples,
       selectedDevice?.target_min_c ?? 2,

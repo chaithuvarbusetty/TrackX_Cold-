@@ -31,6 +31,36 @@ interface LiveFleetMapProps {
 
 type MapStyleMode = 'street' | 'satellite' | 'osm';
 
+// Defensive Leaflet DomUtil & MapPane patch to guard against unmount race conditions
+if (typeof L !== 'undefined') {
+  if (L.DomUtil) {
+    const origGetPosition = L.DomUtil.getPosition;
+    L.DomUtil.getPosition = function (el: HTMLElement) {
+      if (!el) return new L.Point(0, 0);
+      try {
+        return origGetPosition.call(this, el);
+      } catch {
+        return (el as any)?._leaflet_pos || new L.Point(0, 0);
+      }
+    };
+  }
+
+  if (L.Map && L.Map.prototype) {
+    const proto = L.Map.prototype as any;
+    if (proto._getMapPanePos) {
+      const origGetMapPanePos = proto._getMapPanePos;
+      proto._getMapPanePos = function () {
+        if (!this._mapPane) return new L.Point(0, 0);
+        try {
+          return origGetMapPanePos.call(this);
+        } catch {
+          return new L.Point(0, 0);
+        }
+      };
+    }
+  }
+}
+
 class FallbackGridLayer extends L.GridLayer {
   createTile(): HTMLElement {
     const tile = document.createElement('canvas');
@@ -244,10 +274,21 @@ export const LiveFleetMap: React.FC<LiveFleetMapProps> = ({
     mapRef.current = map;
 
     return () => {
-      map.remove();
+      try {
+        map.stop();
+        map.off();
+        markersRef.current.forEach((marker) => {
+          marker.off();
+          try {
+            map.removeLayer(marker);
+          } catch {}
+        });
+        markersRef.current.clear();
+        overlayLayerRef.current?.clearLayers();
+        map.remove();
+      } catch {}
       mapRef.current = null;
       tileLayerRef.current = null;
-      markersRef.current.clear();
       overlayLayerRef.current = null;
       hasCenteredRef.current = false;
       hasFittedTripRef.current = '';
@@ -361,8 +402,10 @@ export const LiveFleetMap: React.FC<LiveFleetMapProps> = ({
       }
     }
 
-    if (mode === 'live' && activeRows.length === 1) {
-      map.panTo([activeRows[0].lat, activeRows[0].lng], { animate: true, duration: 0.5 });
+    if (mode === 'live' && activeRows.length === 1 && activeRows[0].lat != null && activeRows[0].lng != null) {
+      if ((map as any)._loaded) {
+        map.panTo([activeRows[0].lat, activeRows[0].lng], { animate: false });
+      }
     } else if (!hasCenteredRef.current && activeRows.length > 0) {
       const bounds = L.latLngBounds(activeRows.map((r) => [r.lat, r.lng]));
       map.fitBounds(bounds, { padding: [55, 55], maxZoom: 11 });

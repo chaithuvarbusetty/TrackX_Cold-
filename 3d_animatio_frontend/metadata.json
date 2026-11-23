@@ -1,0 +1,6 @@
+{
+  "name": "CryoTransit Cold-Chain Twin",
+  "description": "Real-time 3D cold-storage medical transport visualization with container sensor node, driver cabin gateway, critical temperature alerts, and door tamper detection.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

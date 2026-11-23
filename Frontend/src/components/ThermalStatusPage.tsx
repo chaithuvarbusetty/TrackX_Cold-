@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
@@ -17,6 +17,7 @@ import type {
 import { evaluateVehicleThermalFlow } from '../utils/thermalFlow';
 import { CargoHeroBanner, VehicleCargoBadge } from './CargoShell';
 import { AiForecastChart, Temp24hChart } from './RealtimeCharts';
+import { Viewport3D } from './LazyViewport3D';
 
 interface ThermalStatusPageProps {
   overview: FleetOverviewPayload;
@@ -53,6 +54,37 @@ export const ThermalStatusPage: React.FC<ThermalStatusPageProps> = ({
 
   const evalResult = evaluateVehicleThermalFlow(currentRow);
   const stage = evalResult.stage;
+
+  const thermalTelemetry = useMemo(() => {
+    const rawTemp = currentRow.current_temp_c;
+    const temp =
+      rawTemp !== null && rawTemp !== undefined && !isNaN(Number(rawTemp))
+        ? Number(rawTemp)
+        : 29.0;
+    const minT = evalResult.criticalLowC ?? 2.0;
+    const maxT = evalResult.criticalHighC ?? 8.0;
+    const tempBand =
+      temp > maxT ? 'above_critical' : temp < minT ? 'below_critical' : 'optimal';
+    const isAlert =
+      stage === 'CRITICAL' ||
+      temp > maxT ||
+      temp < minT ||
+      currentRow.security === 'OPEN';
+    return {
+      callsign: currentRow.device_id,
+      temperatureC: temp,
+      tempBand: tempBand as 'optimal' | 'above_critical' | 'below_critical',
+      doorState: (currentRow.security === 'OPEN' ? 'open' : 'closed') as 'open' | 'closed',
+      compressorActive: currentRow.compressor_active ?? true,
+      speedKmh: currentRow.speed_kmh != null ? Number(currentRow.speed_kmh) : 0,
+      vehicleMoving: (currentRow.speed_kmh ?? 0) > 1.0,
+      isAlertActive: isAlert,
+      isDoorTampered: currentRow.security === 'OPEN',
+      accentHex: 0x0d9488,
+      cutawayEnabled: true,
+      cameraPreset: 'node' as const,
+    };
+  }, [currentRow, evalResult, stage]);
 
   const warningOrCriticalUnits = fleet_table.filter((r) => {
     const ev = evaluateVehicleThermalFlow(r);
@@ -449,6 +481,30 @@ export const ThermalStatusPage: React.FC<ThermalStatusPageProps> = ({
             </p>
           </div>
         </div>
+
+        {/* 3D Cutaway Chamber & Sensor Probe Node Twin */}
+        <div className="space-y-3 rounded-xl border border-slate-200 bg-slate-50/60 p-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h3 className="font-display text-sm font-bold text-slate-900">
+                Chamber Internal Cutaway &amp; Telemetry Node Twin ({currentRow.device_id})
+              </h3>
+              <p className="text-xs text-slate-500">
+                Direct view into refrigerated hold with real-time temperature illumination and wireless node beacon
+              </p>
+            </div>
+            <span className="font-mono text-xs font-semibold text-blue-700">
+              Cutaway Mode Active · Node Preset
+            </span>
+          </div>
+
+          <Viewport3D
+            mode="thermal"
+            telemetry={thermalTelemetry}
+            heightClass="h-[360px]"
+            showCutawayToggle={true}
+          />
+        </div>
       </section>
 
       {/* Bottom Row: 24h Thermal Envelope + AI Forecast */}
@@ -494,7 +550,7 @@ export const ThermalStatusPage: React.FC<ThermalStatusPageProps> = ({
               </span>
             </div>
             <AiForecastChart
-              recentTemps={currentRow.history_temps}
+              recentTemps={(currentRow.history_temps || []).filter((t): t is number => t !== null && !isNaN(t))}
               forecast={forecast}
               targetMaxC={currentRow.target_max_c}
             />
