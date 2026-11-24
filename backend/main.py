@@ -9,8 +9,23 @@ dual-layer AI predictions, hardware ingestion, and React SPA static serving.
 """
 
 import os
+import sys
 import asyncio
 import logging
+
+# Silence benign Windows IOCP connection reset traceback (WinError 10054)
+if sys.platform == "win32":
+    try:
+        from asyncio.proactor_events import _ProactorBasePipeTransport
+        _orig_call_conn_lost = _ProactorBasePipeTransport._call_connection_lost
+        def _silent_conn_lost(self, exc):
+            try:
+                _orig_call_conn_lost(self, exc)
+            except (ConnectionResetError, ConnectionAbortedError, OSError):
+                pass
+        _ProactorBasePipeTransport._call_connection_lost = _silent_conn_lost
+    except Exception:
+        pass
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles

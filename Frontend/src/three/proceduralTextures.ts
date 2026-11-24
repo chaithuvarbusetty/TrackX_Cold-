@@ -234,7 +234,7 @@ export function createGatewayScreenTexture(): {
   canvas: HTMLCanvasElement;
   texture: THREE.CanvasTexture;
   draw: (
-    tempC: number,
+    tempC: number | null,
     critical: boolean,
     doorTampered: boolean,
     callsign?: string
@@ -249,7 +249,7 @@ export function createGatewayScreenTexture(): {
   texture.colorSpace = THREE.SRGBColorSpace;
 
   const draw = (
-    tempC: number,
+    tempC: number | null,
     critical: boolean,
     doorTampered: boolean,
     callsign = 'GW-001'
@@ -267,7 +267,7 @@ export function createGatewayScreenTexture(): {
 
     ctx.fillStyle = '#ffffff';
     ctx.font = 'bold 38px monospace';
-    ctx.fillText(Number.isNaN(tempC) ? '--.-°C' : `${tempC.toFixed(1)}°C`, 18, 76);
+    ctx.fillText(tempC == null || Number.isNaN(tempC) ? '--.-°C' : `${tempC.toFixed(1)}°C`, 18, 76);
 
     ctx.fillStyle = doorTampered ? '#ef4444' : critical ? '#fbbf24' : '#34d399';
     ctx.font = 'bold 15px monospace';

@@ -16,6 +16,18 @@ if sys.platform == "win32":
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    # Silence benign Windows IOCP connection reset traceback (WinError 10054)
+    try:
+        from asyncio.proactor_events import _ProactorBasePipeTransport
+        _orig_call_conn_lost = _ProactorBasePipeTransport._call_connection_lost
+        def _silent_conn_lost(self, exc):
+            try:
+                _orig_call_conn_lost(self, exc)
+            except (ConnectionResetError, ConnectionAbortedError, OSError):
+                pass
+        _ProactorBasePipeTransport._call_connection_lost = _silent_conn_lost
+    except Exception:
+        pass
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)

@@ -13,6 +13,7 @@ const NAV_ITEMS: Array<{ id: ModuleId; label: string }> = [
   { id: 'thermal-status', label: 'Thermal Status' },
   { id: 'vehicle-readings', label: 'Vehicle Monitoring' },
   { id: 'trips', label: 'Trips' },
+  { id: 'twin-world', label: '3D Twin World' },
   { id: 'help', label: 'Help' },
 ];
 

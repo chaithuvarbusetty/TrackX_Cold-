@@ -228,7 +228,18 @@ export const AiForecastChart: React.FC<{
   forecast: TemperatureForecast;
   targetMaxC: number;
 }> = ({ recentTemps, forecast, targetMaxC }) => {
-  const fallbackTemp = forecast.current_temp_c != null ? forecast.current_temp_c : 29.0;
+  if (recentTemps.length === 0 && (forecast.current_temp_c === null || forecast.current_temp_c === undefined)) {
+    return (
+      <div className="flex h-40 flex-col items-center justify-center rounded-lg border border-dashed border-slate-300 bg-slate-50/80 p-4 text-center select-none">
+        <span className="font-mono text-xs font-semibold text-slate-700">No Temperature Telemetry Recorded Today</span>
+        <span className="mt-1 text-[11px] text-slate-500 max-w-xs">
+          AI predictive drift curve will calibrate automatically upon arrival of the first 3 sensor packets.
+        </span>
+      </div>
+    );
+  }
+
+  const fallbackTemp = forecast.current_temp_c != null ? forecast.current_temp_c : (recentTemps[0] ?? 4.0);
   const actual: number[] = recentTemps.length > 0 ? recentTemps.slice(-8) : [fallbackTemp];
   const projected: number[] = (forecast.baseline_ready
     ? [

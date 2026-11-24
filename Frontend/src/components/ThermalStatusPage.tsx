@@ -57,27 +57,32 @@ export const ThermalStatusPage: React.FC<ThermalStatusPageProps> = ({
 
   const thermalTelemetry = useMemo(() => {
     const rawTemp = currentRow.current_temp_c;
-    const temp =
-      rawTemp !== null && rawTemp !== undefined && !isNaN(Number(rawTemp))
-        ? Number(rawTemp)
-        : 29.0;
+    const hasValidTemp =
+      rawTemp !== null && rawTemp !== undefined && !isNaN(Number(rawTemp));
+    const temp = hasValidTemp ? Number(rawTemp) : null;
     const minT = evalResult.criticalLowC ?? 2.0;
     const maxT = evalResult.criticalHighC ?? 8.0;
     const tempBand =
-      temp > maxT ? 'above_critical' : temp < minT ? 'below_critical' : 'optimal';
+      temp == null
+        ? 'optimal'
+        : temp > maxT
+          ? 'above_critical'
+          : temp < minT
+            ? 'below_critical'
+            : 'optimal';
     const isAlert =
       stage === 'CRITICAL' ||
-      temp > maxT ||
-      temp < minT ||
+      (temp != null && (temp > maxT || temp < minT)) ||
       currentRow.security === 'OPEN';
+    const speed = currentRow.speed_kmh != null && !isNaN(Number(currentRow.speed_kmh)) ? Number(currentRow.speed_kmh) : 0;
     return {
       callsign: currentRow.device_id,
       temperatureC: temp,
       tempBand: tempBand as 'optimal' | 'above_critical' | 'below_critical',
       doorState: (currentRow.security === 'OPEN' ? 'open' : 'closed') as 'open' | 'closed',
       compressorActive: currentRow.compressor_active ?? true,
-      speedKmh: currentRow.speed_kmh != null ? Number(currentRow.speed_kmh) : 0,
-      vehicleMoving: (currentRow.speed_kmh ?? 0) > 1.0,
+      speedKmh: speed,
+      vehicleMoving: speed > 1.0,
       isAlertActive: isAlert,
       isDoorTampered: currentRow.security === 'OPEN',
       accentHex: 0x0d9488,
@@ -194,10 +199,10 @@ export const ThermalStatusPage: React.FC<ThermalStatusPageProps> = ({
                   <span className="text-slate-400">Unit {idx + 1} of {fleet_table.length}</span>
                 </div>
                 <div className="mt-1 font-mono text-base font-bold text-slate-900 tabular-nums">
-                  {hasTemp ? `${row.current_temp_c!.toFixed(2)}°C` : '--.-°C (Standby)'}
+                  {hasTemp ? `${row.current_temp_c!.toFixed(2)}°C` : '--.-°C'}
                 </div>
                 <div className={`mt-1 font-mono text-[11px] font-semibold ${stageColor}`}>
-                  {isReal && !hasTemp ? 'PROBE STANDBY (NULL)' : ev.stage}
+                  {isReal && !hasTemp ? 'PROBE STANDBY' : ev.stage}
                 </div>
               </button>
             );
@@ -209,12 +214,12 @@ export const ThermalStatusPage: React.FC<ThermalStatusPageProps> = ({
       <section className="surface-panel rounded-xl p-6 space-y-6">
         <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-200 pb-4">
           <div className="space-y-1.5">
-            <div className="flex flex-wrap items-center gap-3">
+            <div className="flex flex-wrap items-center gap-2.5">
               <span className="font-mono text-lg font-bold text-blue-700">
                 {currentRow.device_id}
               </span>
               <span className="font-display text-lg font-semibold text-slate-900">
-                {currentRow.vehicle_name}
+                {currentRow.vehicle_name || 'Refrigerated Carrier'}
               </span>
               <VehicleCargoBadge
                 vehicleName={currentRow.vehicle_name}
@@ -222,20 +227,35 @@ export const ThermalStatusPage: React.FC<ThermalStatusPageProps> = ({
                 compact
               />
               <span
-                className={`font-mono text-xs font-bold ${
+                className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 font-mono text-xs font-bold border shadow-2xs ${
                   stage === 'CRITICAL'
-                    ? 'text-rose-600'
+                    ? 'border-rose-300 bg-rose-50 text-rose-700'
                     : stage === 'WARNING'
-                      ? 'text-amber-600'
+                      ? 'border-amber-300 bg-amber-50 text-amber-700'
                       : stage === 'OFFLINE'
-                        ? 'text-slate-500'
-                        : 'text-emerald-700'
+                        ? 'border-slate-300 bg-slate-100 text-slate-700'
+                        : 'border-emerald-300 bg-emerald-50 text-emerald-700'
                 }`}
               >
-                Status: {stage}
+                <span
+                  className={`h-2 w-2 rounded-full ${
+                    stage === 'CRITICAL'
+                      ? 'bg-rose-500 animate-pulse'
+                      : stage === 'WARNING'
+                        ? 'bg-amber-500'
+                        : stage === 'OFFLINE'
+                          ? 'bg-slate-400'
+                          : 'bg-emerald-500'
+                  }`}
+                />
+                {stage === 'OFFLINE' ? 'OFFLINE' : `STATUS: ${stage}`}
               </span>
             </div>
-            <p className="text-xs text-slate-600">{evalResult.reason}</p>
+            <p className="text-xs text-slate-600">
+              {currentRow.current_temp_c === null
+                ? 'No temperature readings recorded today · Gateway online and awaiting physical sensor probe connection.'
+                : evalResult.reason}
+            </p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
@@ -309,8 +329,8 @@ export const ThermalStatusPage: React.FC<ThermalStatusPageProps> = ({
                   : '--.-°C'}
               </span>
               {currentRow.current_temp_c === null ? (
-                <span className="text-xs font-semibold text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded">
-                  Probe Standby / Unlinked
+                <span className="text-xs font-semibold text-slate-700 bg-slate-100 border border-slate-300 px-2 py-0.5 rounded">
+                  No Readings Today
                 </span>
               ) : (
                 <span className="text-xs text-slate-500">
@@ -490,7 +510,9 @@ export const ThermalStatusPage: React.FC<ThermalStatusPageProps> = ({
                 Chamber Internal Cutaway &amp; Telemetry Node Twin ({currentRow.device_id})
               </h3>
               <p className="text-xs text-slate-500">
-                Direct view into refrigerated hold with real-time temperature illumination and wireless node beacon
+                {currentRow.current_temp_c === null
+                  ? 'Sensor probe in standby · No temperature telemetry recorded today'
+                  : 'Direct view into refrigerated hold with real-time temperature illumination and wireless node beacon'}
               </p>
             </div>
             <span className="font-mono text-xs font-semibold text-blue-700">

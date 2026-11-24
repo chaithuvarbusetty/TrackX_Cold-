@@ -19,6 +19,7 @@ import { ThermalStatusPage } from './components/ThermalStatusPage';
 import { VehicleReadingsPage } from './components/VehicleReadingsPage';
 import { TripsPage } from './components/TripsPage';
 import { HelpPage } from './components/HelpPage';
+import { LazyTwinWorldPage } from './components/LazyTwinWorldPage';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import {
   PrivacyPolicyModal,
@@ -304,17 +305,146 @@ export default function App() {
   }) => {
     const res = await fetch('/api/v1/devices', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'ngrok-skip-browser-warning': 'true',
+      },
       body: JSON.stringify(payload),
     });
-    const body = await res.json();
+    const body = await res.json().catch(() => ({}));
     if (!res.ok) {
-      throw new Error(body.error || 'Failed to register hardware');
+      const msg = typeof body.detail === 'string'
+        ? body.detail
+        : Array.isArray(body.detail)
+          ? body.detail.map((e: any) => e.msg || JSON.stringify(e)).join(', ')
+          : body.error || 'Failed to register hardware';
+      throw new Error(msg);
     }
-    setOverview(body.overview);
-    setDevices((prev) => [...prev, body.device]);
-    setSelectedDeviceId(body.device.device_id);
+    if (body.overview) setOverview(body.overview);
+    if (body.device) {
+      setDevices((prev) => [...prev, body.device]);
+      setSelectedDeviceId(body.device.device_id);
+    }
   };
+
+  const handleUpdateDevice = async (
+    deviceId: string,
+    payload: {
+      vehicle_name?: string;
+      cargo_type?: string;
+      target_min_c?: number;
+      target_max_c?: number;
+      sampling_interval_sec?: number;
+      imei?: string;
+    }
+  ) => {
+    // Optimistically update local state immediately so user sees changed name instantly
+    setOverview((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        fleet_table: prev.fleet_table.map((r) =>
+          r.device_id === deviceId
+            ? {
+                ...r,
+                vehicle_name: payload.vehicle_name?.trim() || r.vehicle_name,
+                cargo_type: payload.cargo_type?.trim() || r.cargo_type,
+                target_min_c: payload.target_min_c ?? r.target_min_c,
+                target_max_c: payload.target_max_c ?? r.target_max_c,
+              }
+            : r
+        ),
+      };
+    });
+    setDevices((prev) =>
+      prev.map((d) =>
+        d.device_id === deviceId
+          ? {
+              ...d,
+              vehicle_name: payload.vehicle_name?.trim() || d.vehicle_name,
+              cargo_type: payload.cargo_type?.trim() || d.cargo_type,
+              target_min_c: payload.target_min_c ?? d.target_min_c,
+              target_max_c: payload.target_max_c ?? d.target_max_c,
+              imei: payload.imei?.trim() || d.imei,
+            }
+          : d
+      )
+    );
+
+    const res = await fetch(`/api/v1/devices/${encodeURIComponent(deviceId)}`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'ngrok-skip-browser-warning': 'true',
+      },
+      body: JSON.stringify(payload),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const msg = typeof body.detail === 'string'
+        ? body.detail
+        : Array.isArray(body.detail)
+          ? body.detail.map((e: any) => e.msg || JSON.stringify(e)).join(', ')
+          : body.error || 'Failed to update vehicle';
+      throw new Error(msg);
+    }
+    if (body.overview) setOverview(body.overview);
+    if (body.device) {
+      setDevices((prev) =>
+        prev.map((d) => (d.device_id === deviceId ? { ...d, ...body.device } : d))
+      );
+    }
+  };
+
+  const handleDeleteDevice = async (deviceId: string) => {
+    const res = await fetch(`/api/v1/devices/${encodeURIComponent(deviceId)}`, {
+      method: 'DELETE',
+      headers: {
+        'ngrok-skip-browser-warning': 'true',
+      },
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const msg = typeof body.detail === 'string'
+        ? body.detail
+        : Array.isArray(body.detail)
+          ? body.detail.map((e: any) => e.msg || JSON.stringify(e)).join(', ')
+          : body.error || 'Failed to delete vehicle';
+      throw new Error(msg);
+    }
+    if (body.overview) {
+      setOverview(body.overview);
+    } else {
+      setOverview((prev) => ({
+        ...prev,
+        fleet_table: prev.fleet_table.filter((r) => r.device_id !== deviceId),
+      }));
+    }
+    setDevices((prev) => prev.filter((d) => d.device_id !== deviceId));
+    setSelectedDeviceId((prev) => (prev === deviceId ? 'GW-001' : prev));
+  };
+
+  // Synchronize browser history so pressing browser Back returns to table without exiting dashboard
+  const handleDetailOpenChange = useCallback((open: boolean) => {
+    if (open) {
+      if (typeof window !== 'undefined') {
+        window.history.pushState({ modal: 'monitoringDetail', deviceId: selectedDeviceId }, '');
+      }
+      setMonitoringDetailOpen(true);
+    } else {
+      setMonitoringDetailOpen(false);
+    }
+  }, [selectedDeviceId]);
+
+  useEffect(() => {
+    const handlePopState = () => {
+      if (monitoringDetailOpen) {
+        setMonitoringDetailOpen(false);
+      }
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, [monitoringDetailOpen]);
 
   const handleSimulationAction = async (action: SimulationActionType) => {
     const res = await fetch('/api/v1/simulate/action', {
@@ -423,6 +553,24 @@ export default function App() {
     );
   }, [selectedHistory, selectedDevice]);
 
+  const liveDeviceState = useMemo(() => {
+    const row = overview?.fleet_table.find((r) => r.device_id === selectedDeviceId);
+    if (!row) return null;
+    return {
+      deviceId: row.device_id,
+      temperature: row.current_temp_c,
+      ambientTemp: row.ambient_temp_c ?? 30.5,
+      doorStatus: (row.security === 'OPEN' ? 'OPEN' : 'SEALED') as 'OPEN' | 'SEALED',
+      speedKmh: row.speed_kmh ?? 0,
+      latitude: row.lat,
+      longitude: row.lng,
+      tamper: row.tamper || (row.security === 'OPEN' && (row.speed_kmh ?? 0) > 2),
+      compressorActive: true,
+      connectivity: (row.connectivity ?? 'ONLINE') as 'ONLINE' | 'STANDBY' | 'OFFLINE',
+      lastUpdatedMs: nowMs,
+    };
+  }, [overview?.fleet_table, selectedDeviceId, nowMs]);
+
   return (
     <div className="relative min-h-screen bg-slate-100 text-slate-900">
       <div className="relative z-10 flex min-h-screen flex-col">
@@ -441,14 +589,17 @@ export default function App() {
           ) : (
             <>
               {activeModule === 'live-tracking' && (
-                <LiveTrackingPage
-                  overview={overview}
-                  selectedDeviceId={selectedDeviceId}
-                  onSelectDevice={setSelectedDeviceId}
-                  onNavigateModule={handleNavigateModule}
-                  onExportCsv={handleExportCsv}
-                  geofences={geofences}
-                />
+                <ErrorBoundary fallbackTitle="Live Fleet Tracking View">
+                  <LiveTrackingPage
+                    overview={overview}
+                    selectedDeviceId={selectedDeviceId}
+                    onSelectDevice={setSelectedDeviceId}
+                    onNavigateModule={handleNavigateModule}
+                    onExportCsv={handleExportCsv}
+                    geofences={geofences}
+                    liveHistory={selectedHistory}
+                  />
+                </ErrorBoundary>
               )}
 
               {activeModule === 'thermal-status' && (
@@ -469,12 +620,14 @@ export default function App() {
                   selectedDeviceId={selectedDeviceId}
                   onSelectDevice={setSelectedDeviceId}
                   detailOpen={monitoringDetailOpen}
-                  onDetailOpenChange={setMonitoringDetailOpen}
+                  onDetailOpenChange={handleDetailOpenChange}
                   liveHistory={selectedHistory}
                   streamPaused={streamPaused}
                   onAction={handleSimulationAction}
                   onExportCsv={handleExportCsv}
                   onRegisterDevice={handleRegisterDevice}
+                  onUpdateDevice={handleUpdateDevice}
+                  onDeleteDevice={handleDeleteDevice}
                   nowMs={nowMs}
                 />
               )}
@@ -490,6 +643,15 @@ export default function App() {
                     onSelectDevice={setSelectedDeviceId}
                     onNavigateModule={handleNavigateModule}
                     onExportCsv={handleExportCsv}
+                  />
+                </ErrorBoundary>
+              )}
+
+              {activeModule === 'twin-world' && (
+                <ErrorBoundary fallbackTitle="3D Digital Twin City World">
+                  <LazyTwinWorldPage
+                    liveDevice={liveDeviceState}
+                    onTriggerBackendAction={handleSimulationAction}
                   />
                 </ErrorBoundary>
               )}
@@ -518,6 +680,7 @@ export default function App() {
         open={drawerOpen}
         onClose={() => setDrawerOpen(false)}
         alerts={alerts}
+        activeAlertCount={overview?.kpis.active_alerts ?? 0}
         fleetRows={overview?.fleet_table ?? []}
         diagnostics={diagnostics}
         onUpdateAlertStatus={handleUpdateAlertStatus}

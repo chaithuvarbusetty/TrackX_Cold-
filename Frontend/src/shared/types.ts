@@ -3,6 +3,7 @@ export type ModuleId =
   | 'thermal-status'
   | 'vehicle-readings'
   | 'trips'
+  | 'twin-world'
   | 'help';
 
 export type OperationalState = 'IN_TRANSIT' | 'AT_STOP' | 'OFFLINE';

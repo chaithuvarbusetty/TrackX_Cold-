@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   ArrowLeft,
   Clock,
@@ -19,7 +19,6 @@ import type {
   TripSummary,
 } from '../shared/types';
 import { LiveFleetMap } from './LiveFleetMap';
-import { Viewport3D } from './LazyViewport3D';
 import {
   CargoHeroBanner,
   SignalStrengthDisplay,
@@ -68,7 +67,6 @@ export const TripsPage: React.FC<TripsPageProps> = ({
   const [tripDetails, setTripDetails] = useState<TripDetails | null>(null);
   const [loadingTrip, setLoadingTrip] = useState(false);
   const [subtab, setSubtab] = useState<'replay' | 'metrics' | 'geofences' | 'events'>('replay');
-  const [tripViewMode, setTripViewMode] = useState<'map' | '3d' | 'split'>('map');
 
   const [replayIdx, setReplayIdx] = useState(0);
   const [playing, setPlaying] = useState(false);
@@ -193,56 +191,6 @@ export const TripsPage: React.FC<TripsPageProps> = ({
     tripDetails?.waypoints[
     Math.min((tripDetails.waypoints.length || 1) - 1, replayIdx)
     ] ?? null;
-
-  const isHaltedAtWp = useMemo(() => {
-    if (!currentWp || !tripDetails?.halts) return false;
-    const wpIso = currentWp.timestamp;
-    if (!wpIso) return false;
-    const wpMs = new Date(wpIso).getTime();
-    if (isNaN(wpMs)) return false;
-    return tripDetails.halts.some((h) => {
-      const startMs = h.start_time ? new Date(h.start_time).getTime() : 0;
-      const endMs = h.end_time ? new Date(h.end_time).getTime() : Infinity;
-      return wpMs >= startMs && wpMs <= endMs;
-    });
-  }, [currentWp, tripDetails?.halts]);
-
-  const replayTelemetry = useMemo(() => {
-    if (!selectedVehicle) return undefined;
-    const rawTemp = currentWp?.cargo_temp_c;
-    const temp =
-      rawTemp !== null && rawTemp !== undefined && !isNaN(Number(rawTemp))
-        ? Number(rawTemp)
-        : selectedVehicle.current_temp_c != null
-        ? Number(selectedVehicle.current_temp_c)
-        : 29.0;
-    const minT = selectedVehicle.target_min_c ?? 2.0;
-    const maxT = selectedVehicle.target_max_c ?? 8.0;
-    const tempBand =
-      temp > maxT ? 'above_critical' : temp < minT ? 'below_critical' : 'optimal';
-    const doorState: 'open' | 'closed' = isHaltedAtWp ? 'open' : 'closed';
-    const speed = isHaltedAtWp
-      ? 0
-      : currentWp?.speed_kmh != null
-      ? Number(currentWp.speed_kmh)
-      : 0;
-    const isAlert = temp > maxT || isHaltedAtWp;
-
-    return {
-      callsign: selectedVehicle.device_id,
-      temperatureC: temp,
-      tempBand: tempBand as 'optimal' | 'above_critical' | 'below_critical',
-      doorState,
-      compressorActive: true,
-      speedKmh: speed,
-      vehicleMoving: speed > 1.0,
-      isAlertActive: isAlert,
-      isDoorTampered: isHaltedAtWp,
-      accentHex: 0x2563eb,
-      cutawayEnabled: false,
-      cameraPreset: 'overview' as const,
-    };
-  }, [selectedVehicle, currentWp, isHaltedAtWp]);
 
   async function handleCreateGeofence(e: React.FormEvent) {
     e.preventDefault();
@@ -474,7 +422,9 @@ export const TripsPage: React.FC<TripsPageProps> = ({
               <p className="text-xs text-slate-600">
                 {selectedTrip
                   ? `${selectedTrip.origin} → ${selectedTrip.destination}`
-                  : `Current location: ${selectedVehicle.address} (${selectedVehicle.lat != null ? selectedVehicle.lat.toFixed(4) : '17.6078'}, ${selectedVehicle.lng != null ? selectedVehicle.lng.toFixed(4) : '78.0791'})`}
+                  : selectedVehicle.lat != null && selectedVehicle.lng != null
+                    ? `${selectedVehicle.connectivity === 'OFFLINE' ? 'Last Known GPS: ' : 'Current GPS: '}${selectedVehicle.lat.toFixed(4)}, ${selectedVehicle.lng.toFixed(4)}${selectedVehicle.address ? ` (${selectedVehicle.address})` : ''}`
+                    : 'Awaiting Initial GNSS Fix · Standby'}
               </p>
             </div>
 
@@ -705,8 +655,8 @@ export const TripsPage: React.FC<TripsPageProps> = ({
 
             <div className="surface-row rounded-lg p-3">
               <div className="text-slate-500">Location</div>
-              <div className="mt-1 font-mono text-sm font-bold text-slate-900 truncate" title={selectedTrip ? selectedTrip.destination : selectedVehicle.address}>
-                {selectedTrip ? selectedTrip.destination : selectedVehicle.address}
+              <div className="mt-1 font-mono text-sm font-bold text-slate-900 truncate" title={selectedTrip ? selectedTrip.destination : (selectedVehicle.address || 'Standby')}>
+                {selectedTrip ? selectedTrip.destination : (selectedVehicle.lat != null && selectedVehicle.lng != null ? `${selectedVehicle.lat.toFixed(4)}, ${selectedVehicle.lng.toFixed(4)}` : 'Awaiting GNSS Fix · Standby')}
               </div>
             </div>
           </div>
@@ -736,99 +686,18 @@ export const TripsPage: React.FC<TripsPageProps> = ({
           {/* Trip Map & Details */}
           {!loadingTrip && tripDetails && subtab === 'replay' && (
             <div className="space-y-4">
-              {/* Trip Replay Visualization Mode Toggle */}
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div className="text-xs font-semibold text-slate-700">
-                  Journey Route &amp; 3D Twin Synchronized Replay
-                </div>
-                <div
-                  role="group"
-                  aria-label="Trip replay visualization modes"
-                  className="flex items-center rounded-lg border border-slate-300 bg-slate-100 p-0.5 text-xs font-semibold"
-                >
-                  <button
-                    type="button"
-                    onClick={() => setTripViewMode('map')}
-                    aria-pressed={tripViewMode === 'map'}
-                    className={`min-h-[44px] min-w-[44px] sm:min-h-0 sm:min-w-0 rounded-md px-3 py-1.5 transition-colors cursor-pointer ${
-                      tripViewMode === 'map'
-                        ? 'bg-white text-slate-900 shadow-xs'
-                        : 'text-slate-600 hover:text-slate-900'
-                    }`}
-                  >
-                    2D Route Map
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setTripViewMode('3d')}
-                    aria-pressed={tripViewMode === '3d'}
-                    className={`min-h-[44px] min-w-[44px] sm:min-h-0 sm:min-w-0 rounded-md px-3 py-1.5 transition-colors cursor-pointer ${
-                      tripViewMode === '3d'
-                        ? 'bg-white text-blue-700 shadow-xs'
-                        : 'text-slate-600 hover:text-slate-900'
-                    }`}
-                  >
-                    3D Time Machine
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setTripViewMode('split')}
-                    aria-pressed={tripViewMode === 'split'}
-                    className={`min-h-[44px] min-w-[44px] sm:min-h-0 sm:min-w-0 rounded-md px-3 py-1.5 transition-colors cursor-pointer ${
-                      tripViewMode === 'split'
-                        ? 'bg-white text-blue-700 shadow-xs'
-                        : 'text-slate-600 hover:text-slate-900'
-                    }`}
-                  >
-                    Split View
-                  </button>
-                </div>
-              </div>
-
-              {tripViewMode === 'map' && (
-                <LiveFleetMap
-                  mode="trip"
-                  tripWaypoints={tripDetails.waypoints}
-                  tripHalts={tripDetails.halts}
-                  geofences={geofences}
-                  replayIndex={replayIdx}
-                  heightClass="h-[400px]"
-                  focusedLabel={selectedVehicle.device_id}
-                  focusedVehicleName={selectedVehicle.vehicle_name}
-                  focusedCargoType={selectedVehicle.cargo_type}
-                  focusedConnectivity={selectedVehicle.connectivity}
-                />
-              )}
-
-              {tripViewMode === '3d' && (
-                <Viewport3D
-                  mode="replay"
-                  telemetry={replayTelemetry}
-                  heightClass="h-[400px]"
-                />
-              )}
-
-              {tripViewMode === 'split' && (
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <LiveFleetMap
-                    mode="trip"
-                    tripWaypoints={tripDetails.waypoints}
-                    tripHalts={tripDetails.halts}
-                    geofences={geofences}
-                    replayIndex={replayIdx}
-                    heightClass="h-[400px]"
-                    focusedLabel={selectedVehicle.device_id}
-                    focusedVehicleName={selectedVehicle.vehicle_name}
-                    focusedCargoType={selectedVehicle.cargo_type}
-                    focusedConnectivity={selectedVehicle.connectivity}
-                  />
-                  <Viewport3D
-                    mode="replay"
-                    telemetry={replayTelemetry}
-                    heightClass="h-[400px]"
-                  />
-                </div>
-              )}
+              <LiveFleetMap
+                mode="trip"
+                tripWaypoints={tripDetails.waypoints}
+                tripHalts={tripDetails.halts}
+                geofences={geofences}
+                replayIndex={replayIdx}
+                heightClass="h-[400px]"
+                focusedLabel={selectedVehicle.device_id}
+                focusedVehicleName={selectedVehicle.vehicle_name}
+                focusedCargoType={selectedVehicle.cargo_type}
+                focusedConnectivity={selectedVehicle.connectivity}
+              />
 
               <div className="surface-row rounded-lg p-4 space-y-3">
                 <div className="flex flex-wrap items-center justify-between gap-3 text-xs">

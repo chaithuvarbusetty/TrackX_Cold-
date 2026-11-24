@@ -33,8 +33,13 @@ async def list_devices():
 
 
 @devices_router.post("/api/v1/devices", status_code=status.HTTP_201_CREATED)
-async def register_new_device(payload: Dict[str, Any]):
+async def register_new_device(request: Request):
     """Registers a new vehicle hardware tracker and updates materialized hot state."""
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
     device_id = payload.get("device_id")
     vehicle_name = payload.get("vehicle_name")
     cargo_type = payload.get("cargo_type")
@@ -70,10 +75,56 @@ async def get_device_by_id(device_id: str):
     return dev
 
 
+@devices_router.put("/api/v1/devices/{device_id}")
+async def update_device_by_id(device_id: str, request: Request):
+    """Updates vehicle metadata (name, cargo, min/max thresholds, IMEI) and broadcasts state."""
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    target_min = payload.get("target_min_c")
+    target_max = payload.get("target_max_c")
+    if target_min is not None and target_max is not None:
+        try:
+            if float(target_min) >= float(target_max):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Target minimum temperature must be strictly less than target maximum temperature"
+                )
+        except ValueError:
+            pass
+
+    updated = coldchain_db.update_device(device_id, payload)
+    if not updated:
+        raise HTTPException(status_code=404, detail=f"Device {device_id} not found")
+
+    coldchain_engine.sync_devices()
+    overview = coldchain_db.get_fleet_overview()
+
+    await manager.broadcast({
+        "type": "INITIAL_FLEET_STATE",
+        "server_ts_ms": int(time.time() * 1000),
+        "query_latency_ms": overview.get("query_latency_ms", 0.1),
+        "fleet": overview.get("fleet_table", [])
+    })
+
+    return {"device": updated, "overview": overview}
+
+
 @devices_router.delete("/api/v1/devices/{device_id}")
 async def delete_device(device_id: str):
     ok = coldchain_db.delete_device(device_id)
     if not ok:
         raise HTTPException(status_code=404, detail=f"Device {device_id} not found")
     coldchain_engine.sync_devices()
-    return {"deleted": True, "message": f"Device {device_id} removed"}
+    overview = coldchain_db.get_fleet_overview()
+
+    await manager.broadcast({
+        "type": "INITIAL_FLEET_STATE",
+        "server_ts_ms": int(time.time() * 1000),
+        "query_latency_ms": overview.get("query_latency_ms", 0.1),
+        "fleet": overview.get("fleet_table", [])
+    })
+
+    return {"deleted": True, "device_id": device_id, "message": f"Device {device_id} removed", "overview": overview}

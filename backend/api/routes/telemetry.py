@@ -193,25 +193,42 @@ async def ingest_hardware_telemetry(payload: Dict[str, Any]):
     """
     print(f"[*] Hardware Ingestion Received: {payload}", flush=True)
     now_ms = int(time.time() * 1000)
-    dev_id = str(payload.get("device_id") or payload.get("gateway_id") or payload.get("dev_id") or payload.get("id") or "GW-001").strip()
     
-    dev = coldchain_db.get_device(dev_id)
-    if not dev:
-        # Auto-provision hardware unit
-        dev = coldchain_db.register_device({
-            "device_id": dev_id,
-            "vehicle_name": f"{dev_id} (Hardware Tracker)",
-            "cargo_type": "Cold-Chain Pharma & Vaccines",
-            "target_min_c": 2.0,
-            "target_max_c": 8.0,
-            "sampling_interval_sec": 2
-        })
-        coldchain_engine.sync_devices()
+    payload_imei = str(payload.get("gateway_imei") or payload.get("imei") or payload.get("IMEI") or payload.get("serial") or payload.get("dev_imei") or "").strip()
+    raw_dev_id = str(payload.get("device_id") or payload.get("gateway_id") or payload.get("dev_id") or payload.get("id") or "").strip()
 
+    dev = None
+    # 1. Lookup by IMEI if provided
+    if payload_imei:
+        dev = coldchain_db.get_device_by_imei(payload_imei)
+
+    # 2. Lookup by device_id if provided
+    if not dev and raw_dev_id:
+        dev = coldchain_db.get_device(raw_dev_id)
+
+    # 3. Fallback to default GW-001 if no identifiers are given
+    if not dev and not raw_dev_id and not payload_imei:
+        dev = coldchain_db.get_device("GW-001")
+
+    if not dev:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Device not registered. Please register the hardware tracker in the dashboard first (IMEI: '{payload_imei}', Device ID: '{raw_dev_id}')."
+        )
+
+    # Strict IMEI verification: If device has an IMEI and payload specifies an IMEI, they must match!
+    reg_imei = str(dev.get("imei") or "").strip()
+    if payload_imei and reg_imei and payload_imei != reg_imei:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"IMEI mismatch: payload IMEI '{payload_imei}' does not match registered device '{dev['device_id']}' IMEI '{reg_imei}'."
+        )
+
+    dev_id = dev["device_id"]
     last_pkt = coldchain_db.get_latest_packet(dev_id)
-    last_lat = float(last_pkt["lat"]) if (last_pkt and last_pkt.get("lat") is not None) else 17.4390934
-    last_lng = float(last_pkt["lng"]) if (last_pkt and last_pkt.get("lng") is not None) else 78.3652306
-    seq = (last_pkt["seq"] + 1) if last_pkt else 1
+    last_lat = float(last_pkt["lat"]) if (last_pkt and last_pkt.get("lat") is not None) else None
+    last_lng = float(last_pkt["lng"]) if (last_pkt and last_pkt.get("lng") is not None) else None
+    seq = (int(last_pkt["seq"]) + 1) if (last_pkt and last_pkt.get("seq") is not None) else 1
     dist = float(last_pkt["distance_km"]) if (last_pkt and last_pkt.get("distance_km") is not None) else 0.0
 
     # Extract sensor values safely with alias fallbacks
@@ -222,10 +239,16 @@ async def ingest_hardware_telemetry(payload: Dict[str, Any]):
         cargo_temp = None
 
     raw_amb = payload.get("ambient_temp_c") if payload.get("ambient_temp_c") is not None else payload.get("ambient_temp", payload.get("amb_temp"))
-    ambient_temp = _safe_float(raw_amb, default=30.2)
+    if raw_amb is not None and str(raw_amb).strip() not in ["", "None", "null", "NONE", "NULL"]:
+        ambient_temp = _safe_float(raw_amb, default=None)
+    else:
+        ambient_temp = None
 
     raw_hum = payload.get("humidity_pct") if payload.get("humidity_pct") is not None else payload.get("humidity", payload.get("hum"))
-    humidity = _safe_float(raw_hum, default=54.0)
+    if raw_hum is not None and str(raw_hum).strip() not in ["", "None", "null", "NONE", "NULL"]:
+        humidity = _safe_float(raw_hum, default=None)
+    else:
+        humidity = None
 
     raw_lat = payload.get("latitude") if payload.get("latitude") is not None else payload.get("lat", payload.get("gps_lat"))
     gps_lat = None
@@ -247,12 +270,18 @@ async def ingest_hardware_telemetry(payload: Dict[str, Any]):
     lat = gps_lat if has_gps_fix else last_lat
     lng = gps_lng if has_gps_fix else last_lng
 
-    # Accurate address lookup
-    if 17.42 <= lat <= 17.46 and 78.33 <= lng <= 78.38:
+    # Accurate address lookup without fake fallbacks
+    if lat is None or lng is None:
+        address = str(payload.get("address") or "Awaiting GPS Fix")
+        sub_area = str(payload.get("sub_area") or "Standby")
+    elif 17.42 <= lat <= 17.46 and 78.33 <= lng <= 78.38:
         address = "Financial District / Gachibowli"
         sub_area = "Hyderabad, Telangana"
+    elif 17.48 <= lat <= 17.58 and 78.40 <= lng <= 78.50:
+        address = "Balanagar / Medchal Cold Depot"
+        sub_area = "Hyderabad, Telangana"
     else:
-        address = str(payload.get("address") or "Hyderabad Logistics Corridor")
+        address = str(payload.get("address") or ("Awaiting GPS Fix" if not has_gps_fix else "Transit Corridor"))
         sub_area = str(payload.get("sub_area") or "Telangana")
 
     # Calculate real-time kinematic displacement, speed, and heading from GPS coordinates
@@ -368,6 +397,14 @@ async def ingest_hardware_telemetry(payload: Dict[str, Any]):
 
         # Real-time Track Formation: Append incoming GPS coordinates as waypoints to active trip
         active_trip = coldchain_db.get_active_trip_for_device(dev_id)
+        if not active_trip and has_gps_fix and gps_lat is not None and gps_lng is not None and speed >= 3.0:
+            active_trip = coldchain_db.create_trip({
+                "device_id": dev_id,
+                "origin": address or "Origin Departure Point",
+                "destination": "En Route Transit Corridor",
+                "start_time": packet["timestamp"]
+            })
+
         if active_trip and has_gps_fix and gps_lat is not None and gps_lng is not None:
             coldchain_db.append_trip_waypoint(
                 active_trip["trip_id"],

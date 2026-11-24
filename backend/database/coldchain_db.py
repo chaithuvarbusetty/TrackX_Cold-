@@ -55,6 +55,30 @@ def _haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> flo
     return 2.0 * R * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
 
 
+def calculate_haynes_mkt_celsius(temperatures_c: List[float]) -> Optional[float]:
+    """
+    Computes thermodynamic Mean Kinetic Temperature (MKT) according to WHO TRS 961 Annex 9
+    and USP <1079> standards using the Haynes equation:
+    Tk = (dH / R) / (-ln( (1/n) * sum(exp(-dH / (R * Ti))) ))
+    where dH / R = 10,000 K (activation energy Ea = 83.144 kJ/mol).
+    """
+    valid = [float(t) for t in temperatures_c if t is not None and not math.isnan(float(t))]
+    if not valid:
+        return None
+    if len(valid) == 1:
+        return round(valid[0], 2)
+    DH_OVER_R = 10000.0
+    try:
+        sum_exp = sum(math.exp(-DH_OVER_R / (t + 273.15)) for t in valid)
+        mean_exp = sum_exp / len(valid)
+        if mean_exp <= 0.0:
+            return round(sum(valid) / len(valid), 2)
+        tk = DH_OVER_R / (-math.log(mean_exp))
+        return round(tk - 273.15, 2)
+    except Exception:
+        return round(sum(valid) / len(valid), 2)
+
+
 class PostgresCursorWrapper:
     """Wraps psycopg2 cursor to mirror sqlite3 cursor semantics (row dicts & lastrowid)."""
     def __init__(self, cursor):
@@ -142,6 +166,16 @@ class PostgresConnectionWrapper:
         self.conn.rollback()
 
 
+def sqlite_row_factory(cursor, row):
+    d = {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
+    class RowDict(dict):
+        def __getitem__(self, key):
+            if isinstance(key, int):
+                return row[key]
+            return super().__getitem__(key)
+    return RowDict(d)
+
+
 class ColdChainDatabase:
     def __init__(self, db_path: Optional[str] = None):
         self.database_url = os.environ.get("DATABASE_URL", "").strip()
@@ -157,8 +191,15 @@ class ColdChainDatabase:
         if self.is_postgres:
             if psycopg2 is None:
                 raise RuntimeError("psycopg2 is required for PostgreSQL. Run: pip install psycopg2-binary")
-            print(f"[*] ColdChain Database Engine: PostgreSQL ({self.database_url.split('@')[-1]})", flush=True)
-            self.pg_pool = SimpleConnectionPool(1, 20, self.database_url)
+            try:
+                self.pg_pool = SimpleConnectionPool(1, 20, self.database_url, connect_timeout=3)
+                print(f"[*] ColdChain Database Engine: PostgreSQL ({self.database_url.split('@')[-1]})", flush=True)
+            except Exception as pg_err:
+                print(f"[!] PostgreSQL connection unavailable ({pg_err}). Falling back automatically to high-performance SQLite WAL.", flush=True)
+                self.is_postgres = False
+                self.pg_pool = None
+                os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), exist_ok=True)
+                print(f"[*] ColdChain Database Engine: SQLite WAL ({self.db_path})", flush=True)
         else:
             os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), exist_ok=True)
             print(f"[*] ColdChain Database Engine: SQLite WAL ({self.db_path})", flush=True)
@@ -189,7 +230,7 @@ class ColdChainDatabase:
             return PostgresConnectionWrapper(raw_conn, pool=self.pg_pool)
 
         conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
+        conn.row_factory = sqlite_row_factory
         try:
             conn.execute("PRAGMA journal_mode = WAL;")
             conn.execute("PRAGMA synchronous = NORMAL;")
@@ -231,7 +272,7 @@ class ColdChainDatabase:
                 device_id TEXT NOT NULL,
                 node_id TEXT NOT NULL,
                 recorded_at_ms INTEGER NOT NULL,
-                cargo_temp_c REAL NOT NULL,
+                cargo_temp_c REAL,
                 ambient_temp_c REAL NOT NULL,
                 humidity_pct REAL NOT NULL,
                 lat REAL NOT NULL,
@@ -243,7 +284,7 @@ class ColdChainDatabase:
                 location_accuracy_m REAL NOT NULL,
                 network_rssi_dbm INTEGER NOT NULL,
                 lte_csq INTEGER NOT NULL,
-                node_rssi_dbm INTEGER NOT NULL,
+                node_rssi_dbm INTEGER DEFAULT -65,
                 node_connected INTEGER NOT NULL,
                 door_status TEXT NOT NULL,
                 tamper INTEGER NOT NULL,
@@ -272,7 +313,7 @@ class ColdChainDatabase:
                 device_id TEXT PRIMARY KEY,
                 seq INTEGER NOT NULL,
                 recorded_at_ms INTEGER NOT NULL,
-                cargo_temp_c REAL NOT NULL,
+                cargo_temp_c REAL,
                 ambient_temp_c REAL NOT NULL,
                 humidity_pct REAL NOT NULL,
                 lat REAL NOT NULL,
@@ -284,7 +325,7 @@ class ColdChainDatabase:
                 location_accuracy_m REAL NOT NULL,
                 network_rssi_dbm INTEGER NOT NULL,
                 lte_csq INTEGER NOT NULL,
-                node_rssi_dbm INTEGER NOT NULL,
+                node_rssi_dbm INTEGER DEFAULT -65,
                 node_connected INTEGER NOT NULL,
                 door_status TEXT NOT NULL,
                 tamper INTEGER NOT NULL,
@@ -407,6 +448,22 @@ class ColdChainDatabase:
 
             CREATE INDEX IF NOT EXISTS idx_alerts_device_ts
                 ON alerts (device_id, created_at_ms DESC);
+
+            CREATE TABLE IF NOT EXISTS registered_mobile_devices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone_number TEXT NOT NULL UNIQUE,
+                recipient_name TEXT NOT NULL,
+                device_name TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                push_subscription_json TEXT,
+                notify_temperature INTEGER NOT NULL DEFAULT 1,
+                notify_door INTEGER NOT NULL DEFAULT 1,
+                notify_tamper INTEGER NOT NULL DEFAULT 1,
+                notify_offline INTEGER NOT NULL DEFAULT 1,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at_ms INTEGER NOT NULL,
+                last_notified_at_ms INTEGER
+            );
             """)
 
     def track_latency(self, latency_ms: float):
@@ -463,6 +520,19 @@ class ColdChainDatabase:
                 self._devices_by_id_cache[device_id] = dev
             return dev
 
+    def get_device_by_imei(self, imei: str) -> Optional[Dict[str, Any]]:
+        clean_imei = str(imei).strip()
+        if not clean_imei:
+            return None
+        devices = self.get_devices()
+        for d in devices:
+            if str(d.get("imei", "")).strip() == clean_imei:
+                return d
+        with self.get_connection() as conn:
+            cursor = conn.execute("SELECT * FROM devices WHERE imei = ?", (clean_imei,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
     def register_device(self, data: Dict[str, Any]) -> Dict[str, Any]:
         self.invalidate_devices_cache()
         dev_id = str(data["device_id"]).strip()
@@ -498,9 +568,9 @@ class ColdChainDatabase:
                 ON CONFLICT(device_id) DO UPDATE SET
                     seq = excluded.seq, recorded_at_ms = excluded.recorded_at_ms
             """, (
-                dev_id, 1, now_ms, 4.4, 29.8, 54, 17.4483, 78.3915, 542, 36.0, 90, 12, 3.1,
-                -76, 18, -66, 1, 'SEALED', 0, 98, 1, 0.0, 'HITEC City Pharma Hub', 'Madhapur, Hyderabad',
-                'HITEC City Pharma Hub', 1, 4.5, 8, 97, json.dumps([4.4, 4.4, 4.4])
+                dev_id, 0, 0, None, None, None, None, None, None, 0.0, 0, 0, None,
+                -99, 0, None, 0, 'Standby', 0, None, 0, 0.0, 'Awaiting Telemetry / Registered', 'Standby',
+                None, 0, None, 0.0, 100.0, json.dumps([])
             ))
             conn.commit()
 
@@ -520,10 +590,58 @@ class ColdChainDatabase:
     def delete_device(self, device_id: str) -> bool:
         self.invalidate_devices_cache()
         with self.get_connection() as conn:
-            cur = conn.execute("DELETE FROM devices WHERE device_id = ?", (device_id,))
+            conn.execute("DELETE FROM trip_waypoints WHERE trip_id IN (SELECT trip_id FROM trips WHERE device_id = ?)", (device_id,))
+            conn.execute("DELETE FROM trips WHERE device_id = ?", (device_id,))
+            conn.execute("DELETE FROM telemetry_logs WHERE device_id = ?", (device_id,))
+            conn.execute("DELETE FROM alerts WHERE device_id = ?", (device_id,))
             conn.execute("DELETE FROM device_latest_state WHERE device_id = ?", (device_id,))
+            cur = conn.execute("DELETE FROM devices WHERE device_id = ?", (device_id,))
             conn.commit()
             return cur.rowcount > 0
+
+    def update_device(self, device_id: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        self.invalidate_devices_cache()
+        fields = []
+        params = []
+
+        if "vehicle_name" in data and str(data["vehicle_name"]).strip():
+            fields.append("vehicle_name = ?")
+            params.append(str(data["vehicle_name"]).strip())
+        if "cargo_type" in data and str(data["cargo_type"]).strip():
+            fields.append("cargo_type = ?")
+            params.append(str(data["cargo_type"]).strip())
+        if "target_min_c" in data and data["target_min_c"] is not None:
+            fields.append("target_min_c = ?")
+            params.append(float(data["target_min_c"]))
+        if "target_max_c" in data and data["target_max_c"] is not None:
+            fields.append("target_max_c = ?")
+            params.append(float(data["target_max_c"]))
+        if "sampling_interval_sec" in data and data["sampling_interval_sec"] is not None:
+            fields.append("sampling_interval_sec = ?")
+            params.append(int(data["sampling_interval_sec"]))
+        if "imei" in data and str(data["imei"]).strip():
+            fields.append("imei = ?")
+            params.append(str(data["imei"]).strip())
+
+        if not fields:
+            return self.get_device(device_id)
+
+        params.append(device_id)
+        sql = f"UPDATE devices SET {', '.join(fields)} WHERE device_id = ?"
+        with self.get_connection() as conn:
+            conn.execute(sql, tuple(params))
+            conn.commit()
+
+        if self.is_postgres and os.path.exists(FRONTEND_DB):
+            try:
+                with sqlite3.connect(FRONTEND_DB) as s_conn:
+                    s_conn.execute(sql, tuple(params))
+                    s_conn.commit()
+            except Exception:
+                pass
+
+        self.invalidate_devices_cache()
+        return self.get_device(device_id)
 
     # --- TELEMETRY & HOT STATE ---
     def record_telemetry_point(self, point: Dict[str, Any], forecast: Dict[str, Any]):
@@ -546,7 +664,8 @@ class ColdChainDatabase:
                 point["cargo_temp_c"], point["ambient_temp_c"], point["humidity_pct"],
                 point["lat"], point["lng"], point.get("altitude_m", 542), point["speed_kmh"],
                 point["heading_deg"], point.get("satellites", 12), point.get("location_accuracy_m", 2.8),
-                point["network_rssi_dbm"], point["lte_csq"], point["node_rssi_dbm"],
+                point["network_rssi_dbm"], point["lte_csq"],
+                point["node_rssi_dbm"] if point.get("node_rssi_dbm") is not None else -65,
                 1 if point.get("node_connected", True) else 0, point["door_status"],
                 1 if point.get("tamper", False) else 0, point["battery_pct"],
                 1 if point.get("compressor_active", True) else 0, point["distance_km"],
@@ -598,7 +717,8 @@ class ColdChainDatabase:
                 point["cargo_temp_c"], point["ambient_temp_c"], point["humidity_pct"],
                 point["lat"], point["lng"], point.get("altitude_m", 542), point["speed_kmh"],
                 point["heading_deg"], point.get("satellites", 12), point.get("location_accuracy_m", 2.8),
-                point["network_rssi_dbm"], point["lte_csq"], point["node_rssi_dbm"],
+                point["network_rssi_dbm"], point["lte_csq"],
+                point["node_rssi_dbm"] if point.get("node_rssi_dbm") is not None else -65,
                 1 if point.get("node_connected", True) else 0, point["door_status"],
                 1 if point.get("tamper", False) else 0, point["battery_pct"],
                 1 if point.get("compressor_active", True) else 0, point["distance_km"],
@@ -644,36 +764,61 @@ class ColdChainDatabase:
             rows = cursor.fetchall()
 
         result = []
-        for r in rows:
-            last_seen_ms = int(r["recorded_at_ms"])
-            age_sec = max(0, int((now_ms - last_seen_ms) / 1000))
-            is_online = age_sec <= 300
-            raw_speed = float(r["speed_kmh"])
-            # If vehicle is offline or stationary, report 0.0 km/h rather than stale movement speed
-            speed = 0.0 if not is_online else raw_speed
-            operational_state = "OFFLINE" if not is_online else ("IN_TRANSIT" if speed >= 2.0 else "AT_STOP")
+        for row in rows:
+            r = dict(row)
+            last_seen_ms = int(r["recorded_at_ms"] or 0)
+            if last_seen_ms == 0:
+                age_sec = 9999999
+                is_online = False
+                last_seen_str = "Never"
+                speed = 0.0
+                operational_state = "OFFLINE"
+                status = "Standby"
+            else:
+                age_sec = max(0, int((now_ms - last_seen_ms) / 1000))
+                is_online = age_sec <= 300
+                raw_speed = float(r["speed_kmh"]) if r["speed_kmh"] is not None else 0.0
+                # If vehicle is offline or stationary, report 0.0 km/h rather than stale movement speed
+                speed = 0.0 if not is_online else raw_speed
+                operational_state = "OFFLINE" if not is_online else ("IN_TRANSIT" if speed >= 2.0 else "AT_STOP")
+                door = "OPEN" if str(r["door_status"]) == "OPEN" else "SEALED"
+                tamper = bool(r["tamper"])
+                raw_temp = r["cargo_temp_c"]
+                temp = float(raw_temp) if raw_temp is not None else None
+                min_c = float(r["target_min_c"])
+                max_c = float(r["target_max_c"])
+
+                if not is_online:
+                    status = "WARNING"
+                elif door == "OPEN" or tamper:
+                    status = "EXCURSION"
+                elif temp is not None:
+                    if temp > max_c or temp < min_c:
+                        status = "EXCURSION"
+                    elif temp >= max_c - 1.0 or temp <= min_c + 0.5:
+                        status = "WARNING"
+                    else:
+                        status = "OPTIMAL"
+                else:
+                    status = "OPTIMAL"
+
+                if age_sec < 3:
+                    last_seen_str = "Just now"
+                elif age_sec < 60:
+                    last_seen_str = f"{age_sec}s ago"
+                elif age_sec < 3600:
+                    last_seen_str = f"{age_sec // 60}m ago"
+                else:
+                    last_seen_str = f"{age_sec // 3600}h ago"
+
             raw_temp = r["cargo_temp_c"]
             temp = float(raw_temp) if raw_temp is not None else None
             min_c = float(r["target_min_c"])
             max_c = float(r["target_max_c"])
-            door = "OPEN" if str(r["door_status"]) == "OPEN" else "SEALED"
+            door = "OPEN" if str(r["door_status"]) == "OPEN" else ("SEALED" if str(r["door_status"]) == "SEALED" else "Standby")
             tamper = bool(r["tamper"])
 
-            if not is_online:
-                status = "WARNING"
-            elif door == "OPEN" or tamper:
-                status = "EXCURSION"
-            elif temp is not None:
-                if temp > max_c or temp < min_c:
-                    status = "EXCURSION"
-                elif temp >= max_c - 1.0 or temp <= min_c + 0.5:
-                    status = "WARNING"
-                else:
-                    status = "OPTIMAL"
-            else:
-                status = "OPTIMAL"
-
-            health_score = float(r["health_score"])
+            health_score = float(r["health_score"]) if r["health_score"] is not None else 100.0
             health_rating = "GOOD" if health_score >= 85 else ("FAIR" if health_score >= 65 else ("POOR" if health_score >= 45 else "CRITICAL"))
 
             try:
@@ -681,18 +826,13 @@ class ColdChainDatabase:
             except Exception:
                 history_temps = [temp] if temp is not None else []
 
-            if age_sec < 3:
-                last_seen_str = "Just now"
-            elif age_sec < 60:
-                last_seen_str = f"{age_sec}s ago"
-            elif age_sec < 3600:
-                last_seen_str = f"{age_sec // 60}m ago"
-            else:
-                last_seen_str = f"{age_sec // 3600}h ago"
-
             node_conn_raw = r.get("node_connected")
-            node_connected = bool(int(node_conn_raw)) if node_conn_raw is not None else True
+            node_connected = bool(int(node_conn_raw)) if node_conn_raw is not None else False
             node_rssi = int(r["node_rssi_dbm"]) if r.get("node_rssi_dbm") is not None else None
+
+            lat_val = float(r["lat"]) if r.get("lat") is not None else None
+            lng_val = float(r["lng"]) if r.get("lng") is not None else None
+            amb_val = float(r["ambient_temp_c"]) if r.get("ambient_temp_c") is not None else None
 
             result.append({
                 "device_id": str(r["device_id"]),
@@ -700,14 +840,14 @@ class ColdChainDatabase:
                 "vehicle_name": str(r["vehicle_name"]),
                 "cargo_type": str(r["cargo_type"]),
                 "current_temp_c": temp,
-                "ambient_temp_c": float(r["ambient_temp_c"]),
+                "ambient_temp_c": amb_val,
                 "target_min_c": min_c,
                 "target_max_c": max_c,
-                "lat": float(r["lat"]),
-                "lng": float(r["lng"]),
+                "lat": lat_val,
+                "lng": lng_val,
                 "speed_kmh": speed,
-                "heading_deg": int(r["heading_deg"]),
-                "network_rssi_dbm": int(r["network_rssi_dbm"]),
+                "heading_deg": int(r["heading_deg"] or 0),
+                "network_rssi_dbm": int(r["network_rssi_dbm"] or -99),
                 "node_connected": node_connected,
                 "node_rssi_dbm": node_rssi,
                 "connectivity": "ONLINE" if is_online else "OFFLINE",
@@ -717,16 +857,16 @@ class ColdChainDatabase:
                 "status": status,
                 "health_score": health_score,
                 "health_rating": health_rating,
-                "predicted_temp_30m_c": float(r["predicted_temp_30m_c"]) if r["predicted_temp_30m_c"] is not None else None,
-                "excursion_risk_pct": float(r["excursion_risk_pct"]),
-                "distance_km": float(r["distance_km"]),
-                "address": str(r["address"]),
-                "geofence_name": str(r["geofence_name"]) if r["geofence_name"] else None,
+                "predicted_temp_30m_c": float(r["predicted_temp_30m_c"]) if r.get("predicted_temp_30m_c") is not None else None,
+                "excursion_risk_pct": float(r["excursion_risk_pct"] or 0.0),
+                "distance_km": float(r["distance_km"] or 0.0),
+                "address": str(r["address"] or "Awaiting Telemetry"),
+                "geofence_name": str(r["geofence_name"]) if r.get("geofence_name") else None,
                 "last_seen_ms": last_seen_ms,
                 "last_seen_str": last_seen_str,
                 "packet_age_sec": age_sec,
-                "seq": int(r["seq"]),
-                "compressor_active": bool(r["compressor_active"]),
+                "seq": int(r["seq"] or 0),
+                "compressor_active": bool(r.get("compressor_active")),
                 "history_temps": history_temps
             })
         return result
@@ -880,37 +1020,38 @@ class ColdChainDatabase:
             rows = cursor.fetchall()
 
         result = []
-        for r in rows:
+        for row in rows:
+            r = dict(row)
             ts_ms = int(r["recorded_at_ms"])
             result.append({
-                "seq": int(r["seq"]),
+                "seq": int(r.get("seq") or 0),
                 "device_id": str(r["device_id"]),
                 "node_id": str(r["node_id"]),
                 "recorded_at_ms": ts_ms,
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts_ms / 1000)),
-                "cargo_temp_c": float(r["cargo_temp_c"]) if r["cargo_temp_c"] is not None else None,
-                "ambient_temp_c": float(r["ambient_temp_c"]),
-                "humidity_pct": float(r["humidity_pct"]),
-                "lat": float(r["lat"]),
-                "lng": float(r["lng"]),
-                "altitude_m": float(r["altitude_m"]),
-                "speed_kmh": float(r["speed_kmh"]),
-                "heading_deg": int(r["heading_deg"]),
-                "satellites": int(r["satellites"]),
-                "location_accuracy_m": float(r["location_accuracy_m"]),
-                "network_rssi_dbm": int(r["network_rssi_dbm"]),
-                "lte_csq": int(r["lte_csq"]),
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts_ms / 1000)) if ts_ms > 0 else "Never",
+                "cargo_temp_c": float(r["cargo_temp_c"]) if r.get("cargo_temp_c") is not None else None,
+                "ambient_temp_c": float(r["ambient_temp_c"]) if r.get("ambient_temp_c") is not None else None,
+                "humidity_pct": float(r["humidity_pct"]) if r.get("humidity_pct") is not None else None,
+                "lat": float(r["lat"]) if r.get("lat") is not None else None,
+                "lng": float(r["lng"]) if r.get("lng") is not None else None,
+                "altitude_m": float(r["altitude_m"]) if r.get("altitude_m") is not None else None,
+                "speed_kmh": float(r["speed_kmh"]) if r.get("speed_kmh") is not None else 0.0,
+                "heading_deg": int(r.get("heading_deg") or 0),
+                "satellites": int(r.get("satellites") or 0),
+                "location_accuracy_m": float(r["location_accuracy_m"]) if r.get("location_accuracy_m") is not None else None,
+                "network_rssi_dbm": int(r.get("network_rssi_dbm") or -99),
+                "lte_csq": int(r.get("lte_csq") or 0),
                 "node_rssi_dbm": int(r["node_rssi_dbm"]) if r.get("node_rssi_dbm") is not None else None,
-                "node_connected": bool(int(r["node_connected"])) if r.get("node_connected") is not None else True,
-                "door_status": str(r["door_status"]),
-                "tamper": bool(r["tamper"]),
-                "battery_pct": float(r["battery_pct"]),
-                "compressor_active": bool(r["compressor_active"]),
-                "distance_km": float(r["distance_km"]),
-                "address": str(r["address"]),
-                "sub_area": str(r["sub_area"]),
-                "geofence_name": str(r["geofence_name"]) if r["geofence_name"] else None,
-                "geofence_inside": bool(r["geofence_inside"])
+                "node_connected": bool(int(r["node_connected"])) if r.get("node_connected") is not None else False,
+                "door_status": str(r.get("door_status") or "Standby"),
+                "tamper": bool(r.get("tamper", False)),
+                "battery_pct": float(r["battery_pct"]) if r.get("battery_pct") is not None else None,
+                "compressor_active": bool(r.get("compressor_active", False)),
+                "distance_km": float(r.get("distance_km") or 0.0),
+                "address": str(r.get("address") or "Awaiting Telemetry"),
+                "sub_area": str(r.get("sub_area") or ""),
+                "geofence_name": str(r["geofence_name"]) if r.get("geofence_name") else None,
+                "geofence_inside": bool(r.get("geofence_inside", False))
             })
         return list(reversed(result))
 
@@ -923,32 +1064,32 @@ class ColdChainDatabase:
                 ts_ms = int(r["recorded_at_ms"])
                 node_conn_raw = r.get("node_connected")
                 return {
-                    "seq": int(r["seq"]),
+                    "seq": int(r.get("seq") or 0),
                     "device_id": str(r["device_id"]),
                     "node_id": str(r.get("node_id") or "NODE-001"),
                     "recorded_at_ms": ts_ms,
-                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts_ms / 1000)),
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts_ms / 1000)) if ts_ms > 0 else "Never",
                     "cargo_temp_c": float(r["cargo_temp_c"]) if r.get("cargo_temp_c") is not None else None,
-                    "ambient_temp_c": float(r.get("ambient_temp_c", 30.0)),
-                    "humidity_pct": float(r.get("humidity_pct", 50.0)),
-                    "lat": float(r["lat"]),
-                    "lng": float(r["lng"]),
-                    "altitude_m": float(r.get("altitude_m", 542.0)),
-                    "speed_kmh": float(r.get("speed_kmh", 0.0)),
-                    "heading_deg": int(r.get("heading_deg", 90)),
-                    "satellites": int(r.get("satellites", 12)),
-                    "location_accuracy_m": float(r.get("location_accuracy_m", 2.8)),
-                    "network_rssi_dbm": int(r.get("network_rssi_dbm", -75)),
-                    "lte_csq": int(r.get("lte_csq", 18)),
+                    "ambient_temp_c": float(r["ambient_temp_c"]) if r.get("ambient_temp_c") is not None else None,
+                    "humidity_pct": float(r["humidity_pct"]) if r.get("humidity_pct") is not None else None,
+                    "lat": float(r["lat"]) if r.get("lat") is not None else None,
+                    "lng": float(r["lng"]) if r.get("lng") is not None else None,
+                    "altitude_m": float(r["altitude_m"]) if r.get("altitude_m") is not None else None,
+                    "speed_kmh": float(r["speed_kmh"]) if r.get("speed_kmh") is not None else 0.0,
+                    "heading_deg": int(r.get("heading_deg") or 0),
+                    "satellites": int(r.get("satellites") or 0),
+                    "location_accuracy_m": float(r["location_accuracy_m"]) if r.get("location_accuracy_m") is not None else None,
+                    "network_rssi_dbm": int(r.get("network_rssi_dbm") or -99),
+                    "lte_csq": int(r.get("lte_csq") or 0),
                     "node_rssi_dbm": int(r["node_rssi_dbm"]) if r.get("node_rssi_dbm") is not None else None,
-                    "node_connected": bool(int(node_conn_raw)) if node_conn_raw is not None else True,
-                    "door_status": str(r.get("door_status", "SEALED")),
+                    "node_connected": bool(int(node_conn_raw)) if node_conn_raw is not None else False,
+                    "door_status": str(r.get("door_status") or "Standby"),
                     "tamper": bool(r.get("tamper", False)),
-                    "battery_pct": float(r.get("battery_pct", 95.0)),
-                    "compressor_active": bool(r.get("compressor_active", True)),
-                    "distance_km": float(r.get("distance_km", 0.0)),
-                    "address": str(r.get("address", "")),
-                    "sub_area": str(r.get("sub_area", "")),
+                    "battery_pct": float(r["battery_pct"]) if r.get("battery_pct") is not None else None,
+                    "compressor_active": bool(r.get("compressor_active", False)),
+                    "distance_km": float(r.get("distance_km") or 0.0),
+                    "address": str(r.get("address") or "Awaiting Telemetry"),
+                    "sub_area": str(r.get("sub_area") or ""),
                     "geofence_name": str(r["geofence_name"]) if r.get("geofence_name") else None,
                     "geofence_inside": bool(r.get("geofence_inside", False))
                 }
@@ -1058,12 +1199,12 @@ class ColdChainDatabase:
 
             for t in trips:
                 t_id = t["trip_id"]
-                cur_t = conn.execute("SELECT COUNT(cargo_temp_c) AS cnt, MIN(cargo_temp_c) AS min_t, MAX(cargo_temp_c) AS max_t, AVG(cargo_temp_c) AS avg_t FROM trip_waypoints WHERE trip_id = ?", (t_id,))
-                row_t = cur_t.fetchone()
-                if row_t and int(row_t["cnt"] or 0) > 0:
-                    t["min_temp_c"] = round(float(row_t["min_t"]), 1) if row_t["min_t"] is not None else None
-                    t["max_temp_c"] = round(float(row_t["max_t"]), 1) if row_t["max_t"] is not None else None
-                    t["mkt_temp_c"] = round(float(row_t["avg_t"]), 2) if row_t["avg_t"] is not None else None
+                cur_t = conn.execute("SELECT cargo_temp_c FROM trip_waypoints WHERE trip_id = ? AND cargo_temp_c IS NOT NULL", (t_id,))
+                w_temps = [float(r["cargo_temp_c"]) for r in cur_t.fetchall() if r["cargo_temp_c"] is not None]
+                if w_temps:
+                    t["min_temp_c"] = round(min(w_temps), 1)
+                    t["max_temp_c"] = round(max(w_temps), 1)
+                    t["mkt_temp_c"] = calculate_haynes_mkt_celsius(w_temps)
                 else:
                     t["min_temp_c"] = None
                     t["max_temp_c"] = None
@@ -1125,7 +1266,7 @@ class ColdChainDatabase:
         if valid_temps:
             trip["min_temp_c"] = round(min(valid_temps), 1)
             trip["max_temp_c"] = round(max(valid_temps), 1)
-            trip["mkt_temp_c"] = round(sum(valid_temps) / len(valid_temps), 2)
+            trip["mkt_temp_c"] = calculate_haynes_mkt_celsius(valid_temps)
         else:
             trip["min_temp_c"] = None
             trip["max_temp_c"] = None
@@ -1161,10 +1302,15 @@ class ColdChainDatabase:
 
     def get_daily_trips_for_device(self, device_id: str, date_str: Optional[str] = None) -> List[Dict[str, Any]]:
         """Retrieves all trip routes and breadcrumbs for a vehicle on a specific day for cumulative daily map display."""
+        if not isinstance(date_str, str) or not date_str.strip():
+            date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today_start_iso = f"{date_str}T00:00:00"
+        today_like = f"{date_str}%"
+
         with self.get_connection() as conn:
             cur = conn.execute(
-                "SELECT * FROM trips WHERE device_id = ? ORDER BY start_time ASC",
-                (device_id,)
+                "SELECT * FROM trips WHERE device_id = ? AND (start_time >= ? OR start_time LIKE ?) ORDER BY start_time ASC",
+                (device_id, today_start_iso, today_like)
             )
             trips = [dict(r) for r in cur.fetchall()]
 
@@ -1230,6 +1376,76 @@ class ColdChainDatabase:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (trip_id, seq, lat, lng, calc_spd or 0.0, heading_deg, temp_val, timestamp))
             conn.commit()
+
+    def create_trip(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Creates and dispatches a new active journey manifest for any fleet or IoT hardware device."""
+        dev_id = str(data["device_id"]).strip()
+        trip_id = data.get("trip_id")
+        if not trip_id:
+            num = 100 + (hash(f"{dev_id}-{time.time()}") % 899)
+            year = datetime.now(timezone.utc).year
+            trip_id = f"TRP-{year}-{num:03d}"
+
+        origin = str(data.get("origin") or "Hyderabad Central Dispatch").strip()
+        destination = str(data.get("destination") or "Regional Cold Storage").strip()
+        now_iso = data.get("start_time") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        with self.get_connection() as conn:
+            conn.execute("""
+                UPDATE trips SET status = 'COMPLETED', end_time = ?
+                WHERE device_id = ? AND status = 'IN_PROGRESS'
+            """, (now_iso, dev_id))
+
+            conn.execute("""
+                INSERT INTO trips (
+                    trip_id, device_id, origin, destination, start_time, end_time,
+                    duration_minutes, total_distance_km, avg_speed_kmh, max_speed_kmh,
+                    min_temp_c, max_temp_c, mkt_temp_c, halt_count, excursion_flag, status
+                ) VALUES (?, ?, ?, ?, ?, NULL, 0, 0.0, 0.0, 0.0, NULL, NULL, NULL, 0, 0, 'IN_PROGRESS')
+                ON CONFLICT (trip_id) DO UPDATE SET
+                    status = 'IN_PROGRESS',
+                    origin = EXCLUDED.origin,
+                    destination = EXCLUDED.destination,
+                    start_time = EXCLUDED.start_time
+            """, (trip_id, dev_id, origin, destination, now_iso))
+
+            cur_s = conn.execute("SELECT lat, lng, speed_kmh, heading_deg, cargo_temp_c FROM device_latest_state WHERE device_id = ?", (dev_id,))
+            s_row = cur_s.fetchone()
+            if s_row and s_row.get("lat") is not None and s_row.get("lng") is not None:
+                conn.execute("""
+                    INSERT INTO trip_waypoints (trip_id, seq, lat, lng, speed_kmh, heading_deg, cargo_temp_c, timestamp)
+                    VALUES (?, 1, ?, ?, ?, ?, ?, ?)
+                """, (
+                    trip_id, float(s_row["lat"]), float(s_row["lng"]),
+                    float(s_row.get("speed_kmh") or 0.0), int(s_row.get("heading_deg") or 0),
+                    s_row.get("cargo_temp_c"), now_iso
+                ))
+            conn.commit()
+
+        self.invalidate_active_trips_cache(dev_id)
+        return self.get_trip_details(trip_id) or {
+            "trip_id": trip_id, "device_id": dev_id, "origin": origin,
+            "destination": destination, "status": "IN_PROGRESS", "start_time": now_iso
+        }
+
+    def complete_trip(self, trip_id: str) -> Optional[Dict[str, Any]]:
+        """Finalizes an active journey manifest, calculating total distance, duration, and MKT compliance."""
+        details = self.get_trip_details(trip_id)
+        if not details:
+            return None
+
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with self.get_connection() as conn:
+            conn.execute("""
+                UPDATE trips
+                SET status = 'COMPLETED',
+                    end_time = COALESCE(end_time, ?)
+                WHERE trip_id = ?
+            """, (now_iso, trip_id))
+            conn.commit()
+
+        self.invalidate_active_trips_cache(details.get("device_id"))
+        return self.get_trip_details(trip_id)
 
     # --- GEOFENCES ---
     def get_geofences(self) -> List[Dict[str, Any]]:
@@ -1311,7 +1527,7 @@ class ColdChainDatabase:
             params.append(status)
 
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        sql = f"SELECT * FROM alerts {where_sql} ORDER BY created_at_ms DESC LIMIT 100"
+        sql = f"SELECT * FROM alerts {where_sql} ORDER BY CASE WHEN status = 'Active' THEN 0 ELSE 1 END, created_at_ms DESC LIMIT 300"
 
         with self.get_connection() as conn:
             cursor = conn.execute(sql, params)
@@ -1336,17 +1552,42 @@ class ColdChainDatabase:
         return result
 
     def insert_alert(self, alert: Dict[str, Any]) -> Dict[str, Any]:
+        dev_id = alert["device_id"]
+        alt_type = alert["alert_type"]
+        status = alert.get("status", "Active")
         ts_ms = int(alert.get("created_at_ms") or time.time() * 1000)
+
         with self.get_connection() as conn:
+            # Prevent duplicate active incident spam: if an Active alert already exists for (dev_id, alert_type), update it
+            if status == "Active":
+                cur_existing = conn.execute(
+                    "SELECT alert_id FROM alerts WHERE device_id = ? AND alert_type = ? AND status = 'Active'",
+                    (dev_id, alt_type)
+                )
+                existing = cur_existing.fetchone()
+                if existing:
+                    existing_id = existing["alert_id"]
+                    conn.execute(
+                        "UPDATE alerts SET message = ?, severity = ?, ai_analysis = ?, created_at_ms = ? WHERE alert_id = ?",
+                        (alert["message"], alert["severity"], alert.get("ai_analysis", ""), ts_ms, existing_id)
+                    )
+                    conn.commit()
+                    tm = time.localtime(ts_ms / 1000)
+                    res = dict(alert)
+                    res["alert_id"] = str(existing_id)
+                    res["created_at_ms"] = ts_ms
+                    res["time_str"] = time.strftime("%H:%M:%S", tm)
+                    return res
+
             conn.execute("""
                 INSERT INTO alerts (
                     alert_id, device_id, alert_type, message, severity, ai_analysis, status, created_at_ms
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (alert_id) DO NOTHING
             """, (
-                alert["alert_id"], alert["device_id"], alert["alert_type"],
+                alert["alert_id"], dev_id, alt_type,
                 alert["message"], alert["severity"], alert.get("ai_analysis", ""),
-                alert.get("status", "Active"), ts_ms
+                status, ts_ms
             ))
             conn.commit()
 

@@ -118,7 +118,7 @@ def compute_thermal_forecast(
             "excursion_risk_pct": 0,
             "risk_level": "LOW",
             "baseline_ready": False,
-            "recommendation": "Probe standby: Gateway active, awaiting digital sensor probe telemetry."
+            "recommendation": "No temperature telemetry recorded today · Sensor probe in standby."
         }
     ordered = sorted(valid_samples, key=lambda s: s["recorded_at_ms"])
     current = ordered[-1]["cargo_temp_c"]
@@ -150,13 +150,20 @@ def compute_thermal_forecast(
     damped_slope = raw_slope * 0.12 if (span_min < 1.0 and total_delta < 0.35) else raw_slope
     slope = max(-0.45, min(0.45, damped_slope))
 
-    pred15 = round(current + slope * 15 * 0.85, 2)
-    pred30 = round(current + slope * 30 * 0.70, 2)
-    pred60 = round(current + slope * 60 * 0.52, 2)
+    # AI Multi-factor acceleration: Factor latest ambient thermal load if available
+    latest_pkt = ordered[-1]
+    ambient = latest_pkt.get("ambient_temp_c")
+    ambient_penalty = 1.0
+    if ambient is not None and ambient > 35.0:
+        ambient_penalty = min(1.35, 1.0 + (ambient - 35.0) * 0.035)
+
+    pred15 = round(current + slope * 15 * 0.85 * ambient_penalty, 2)
+    pred30 = round(current + slope * 30 * 0.70 * ambient_penalty, 2)
+    pred60 = round(current + slope * 60 * 0.52 * ambient_penalty, 2)
 
     risk_pct = 8
     if current > target_max_c or current < target_min_c:
-        risk_pct = 92
+        risk_pct = 94
     elif pred30 > target_max_c or pred30 < target_min_c:
         risk_pct = 78
     elif pred60 > target_max_c or pred60 < target_min_c:
@@ -168,14 +175,24 @@ def compute_thermal_forecast(
 
     risk_level = "HIGH" if risk_pct >= 70 else ("MODERATE" if risk_pct >= 35 else "LOW")
 
+    # Situational AI Prescriptions
+    is_door_open = str(latest_pkt.get("door_status", "")).upper() == "OPEN"
+    is_compressor_active = bool(latest_pkt.get("compressor_active", True))
+
     if current > target_max_c:
-        recommendation = "CRITICAL: Cargo temperature above threshold. Inspect refrigeration compressor and door seal immediately."
+        recommendation = f"CRITICAL: Chamber temp ({current:.1f}°C) exceeds {target_max_c:.1f}°C ceiling. Verify evaporator airflow and hold cargo doors sealed."
+    elif is_door_open and slope > 0.08:
+        recommendation = f"RAPID HEAT INGRESS (+{slope:.2f}°C/min): Rear cargo doors OPEN. Seal cargo bay immediately to prevent cold chain excursion."
+    elif not is_compressor_active and slope > 0.05:
+        recommendation = f"COOLING IDLE: Compressor inactive while chamber warming (+{slope:.2f}°C/min). Inspect reefer power circuit and thermostat setpoint."
+    elif ambient is not None and ambient > 38.0 and slope > 0.03:
+        recommendation = f"EXTREME AMBIENT HEAT ({ambient:.1f}°C): High thermal gradient on container walls. Maintain continuous compressor duty."
     elif risk_level == "HIGH":
-        recommendation = f"Thermal drift (+{slope:.2f}°C/min) projected to breach {target_max_c}°C within 30m."
+        recommendation = f"THERMAL DRIFT PRE-ALERT: Projected to breach {target_max_c:.1f}°C within 30 minutes at current rate (+{slope:.2f}°C/min)."
     elif risk_level == "MODERATE":
-        recommendation = "Mild thermal warming trend observed. Monitor door dwell intervals."
+        recommendation = "MILD THERMAL WARMING: Monitor door dwell intervals and maintain 2.0–8.0°C GDP band."
     else:
-        recommendation = "Operating within GDP pharmaceutical cold-chain band (2.0–8.0°C)."
+        recommendation = f"GDP COMPLIANCE VERIFIED: Operating safely within {target_min_c:.1f}–{target_max_c:.1f}°C pharmaceutical custody."
 
     return {
         "current_temp_c": round(current, 2),
@@ -203,7 +220,9 @@ def point_in_polygon(lat: float, lng: float, coords: List[List[float]]) -> bool:
     return inside
 
 
-def evaluate_geofences(lat: float, lng: float, geofences: List[Dict[str, Any]]) -> Dict[str, Any]:
+def evaluate_geofences(lat: Optional[float], lng: Optional[float], geofences: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if lat is None or lng is None:
+        return {"inside": False, "geofence_name": None, "geofence_id": None}
     for gf in geofences:
         if not gf.get("enabled", True):
             continue
@@ -229,29 +248,27 @@ class DeviceSimState:
     def __init__(self, dev: Dict[str, Any], initial_row: Optional[Dict[str, Any]] = None):
         self.device = dev
         self.dev_id = dev["device_id"]
-        self.is_real = (self.dev_id == "GW-001")
-        self.seq = initial_row["seq"] if initial_row else 1
-        num_suffix = int("".join([c for c in self.dev_id if c.isdigit()] or ["1"]))
-        self.progress = (num_suffix * 0.27) % 2.0
-        self.route_id = int(dev.get("route_id", num_suffix % 3))
+        # In live operations, all registered devices represent real IoT physical hardware.
+        # No synthetic fake data is generated unless simulation is explicitly requested.
+        self.is_real = bool(dev.get("is_simulation", False) is False)
+        self.seq = initial_row["seq"] if (initial_row and initial_row.get("seq") is not None) else 0
+        self.progress = 0.0
+        self.route_id = int(dev.get("route_id", 0))
         self.route = HYDERABAD_CORRIDORS[self.route_id % len(HYDERABAD_CORRIDORS)] if not self.is_real else []
 
-        default_temp = None if self.is_real else 4.4
-        self.cargo_temp = initial_row.get("cargo_temp_c") if (initial_row and initial_row.get("cargo_temp_c") is not None) else default_temp
-        self.ambient_temp = initial_row.get("ambient_temp_c", 30.2) if initial_row else 30.2
-        self.humidity = 54.0
-        self.door_status = str(initial_row.get("door_status", "SEALED")) if initial_row else "SEALED"
+        self.cargo_temp = initial_row.get("cargo_temp_c") if (initial_row and initial_row.get("cargo_temp_c") is not None) else None
+        self.ambient_temp = initial_row.get("ambient_temp_c") if (initial_row and initial_row.get("ambient_temp_c") is not None) else None
+        self.humidity = initial_row.get("humidity_pct") if (initial_row and initial_row.get("humidity_pct") is not None) else None
+        self.door_status = str(initial_row.get("door_status", "Standby")) if initial_row else "Standby"
         self.tamper = bool(initial_row.get("tamper", False)) if initial_row else False
-        self.compressor_active = True
+        self.compressor_active = bool(initial_row.get("compressor_active", False)) if initial_row else False
         self.fault_mode = "NONE"
         self.stopped = self.is_real
-        self.distance_km = float(initial_row.get("distance_km", 0.0)) if initial_row else 0.0
+        self.distance_km = float(initial_row.get("distance_km", 0.0)) if (initial_row and initial_row.get("distance_km") is not None) else 0.0
         
-        default_lat = 17.4390934 if self.is_real else (self.route[0]["lat"] if self.route else 17.4483)
-        default_lng = 78.3652306 if self.is_real else (self.route[0]["lng"] if self.route else 78.3915)
-        self.anchor_lat = float(initial_row.get("lat", default_lat)) if initial_row else default_lat
-        self.anchor_lng = float(initial_row.get("lng", default_lng)) if initial_row else default_lng
-        self.battery_pct = float(initial_row.get("battery_pct", 95.0)) if initial_row else 95.0
+        self.anchor_lat = float(initial_row["lat"]) if (initial_row and initial_row.get("lat") is not None) else None
+        self.anchor_lng = float(initial_row["lng"]) if (initial_row and initial_row.get("lng") is not None) else None
+        self.battery_pct = float(initial_row.get("battery_pct")) if (initial_row and initial_row.get("battery_pct") is not None) else None
         self.recent_samples: List[Dict[str, Any]] = []
         self.last_packet: Optional[Dict[str, Any]] = None
 

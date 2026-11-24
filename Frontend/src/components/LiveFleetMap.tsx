@@ -31,36 +31,6 @@ interface LiveFleetMapProps {
 
 type MapStyleMode = 'street' | 'satellite' | 'osm';
 
-// Defensive Leaflet DomUtil & MapPane patch to guard against unmount race conditions
-if (typeof L !== 'undefined') {
-  if (L.DomUtil) {
-    const origGetPosition = L.DomUtil.getPosition;
-    L.DomUtil.getPosition = function (el: HTMLElement) {
-      if (!el) return new L.Point(0, 0);
-      try {
-        return origGetPosition.call(this, el);
-      } catch {
-        return (el as any)?._leaflet_pos || new L.Point(0, 0);
-      }
-    };
-  }
-
-  if (L.Map && L.Map.prototype) {
-    const proto = L.Map.prototype as any;
-    if (proto._getMapPanePos) {
-      const origGetMapPanePos = proto._getMapPanePos;
-      proto._getMapPanePos = function () {
-        if (!this._mapPane) return new L.Point(0, 0);
-        try {
-          return origGetMapPanePos.call(this);
-        } catch {
-          return new L.Point(0, 0);
-        }
-      };
-    }
-  }
-}
-
 class FallbackGridLayer extends L.GridLayer {
   createTile(): HTMLElement {
     const tile = document.createElement('canvas');
@@ -217,6 +187,7 @@ export const LiveFleetMap: React.FC<LiveFleetMapProps> = ({
   const overlayLayerRef = useRef<L.LayerGroup | null>(null);
   const hasCenteredRef = useRef(false);
   const hasFittedTripRef = useRef<string>('');
+  const prevSelectedDeviceRef = useRef<string | undefined>(selectedDeviceId);
   const [mapStyle, setMapStyle] = useState<MapStyleMode>('street');
 
   const handleZoomIn = () => {
@@ -238,12 +209,22 @@ export const LiveFleetMap: React.FC<LiveFleetMapProps> = ({
     const map = mapRef.current;
     if (!map) return;
     if (mode === 'trip' && tripWaypoints.length > 0) {
-      const allCoords = tripWaypoints.map((w) => [w.lat, w.lng] as [number, number]);
-      const bounds = L.latLngBounds(allCoords);
-      map.fitBounds(bounds, { padding: [55, 55], maxZoom: 11 });
+      const validWaypoints = tripWaypoints.filter(
+        (w) => w.lat != null && w.lng != null && !isNaN(Number(w.lat)) && !isNaN(Number(w.lng))
+      );
+      if (validWaypoints.length > 0) {
+        const allCoords = validWaypoints.map((w) => [w.lat, w.lng] as [number, number]);
+        const bounds = L.latLngBounds(allCoords);
+        map.fitBounds(bounds, { padding: [55, 55], maxZoom: 11 });
+      }
     } else if (fleetRows.length > 0) {
-      const bounds = L.latLngBounds(fleetRows.map((r) => [r.lat, r.lng]));
-      map.fitBounds(bounds, { padding: [55, 55], maxZoom: 11 });
+      const validCoords = fleetRows
+        .filter((r) => r.lat != null && r.lng != null && !isNaN(Number(r.lat)) && !isNaN(Number(r.lng)))
+        .map((r) => [r.lat, r.lng] as [number, number]);
+      if (validCoords.length > 0) {
+        const bounds = L.latLngBounds(validCoords);
+        map.fitBounds(bounds, { padding: [55, 55], maxZoom: 11 });
+      }
     }
   };
 
@@ -253,7 +234,7 @@ export const LiveFleetMap: React.FC<LiveFleetMapProps> = ({
     const map = L.map(containerRef.current, {
       center: [17.4483, 78.415],
       zoom: 12,
-      zoomControl: true,
+      zoomControl: false,
       attributionControl: true,
     });
 
@@ -276,17 +257,16 @@ export const LiveFleetMap: React.FC<LiveFleetMapProps> = ({
     return () => {
       try {
         map.stop();
-        map.off();
         markersRef.current.forEach((marker) => {
           marker.off();
           try {
             map.removeLayer(marker);
-          } catch {}
+          } catch { }
         });
         markersRef.current.clear();
         overlayLayerRef.current?.clearLayers();
         map.remove();
-      } catch {}
+      } catch { }
       mapRef.current = null;
       tileLayerRef.current = null;
       overlayLayerRef.current = null;
@@ -343,6 +323,22 @@ export const LiveFleetMap: React.FC<LiveFleetMapProps> = ({
 
     const seenIds = new Set<string>();
     for (const row of activeRows) {
+      const hasCoords =
+        row.lat != null &&
+        row.lng != null &&
+        !isNaN(Number(row.lat)) &&
+        !isNaN(Number(row.lng));
+
+      if (!hasCoords) {
+        // If device has no GPS fix yet (registered in standby), remove any stale marker and skip
+        const existing = markersRef.current.get(row.device_id);
+        if (existing) {
+          map.removeLayer(existing);
+          markersRef.current.delete(row.device_id);
+        }
+        continue;
+      }
+
       seenIds.add(row.device_id);
       const isSelected = row.device_id === selectedDeviceId;
       const existing = markersRef.current.get(row.device_id);
@@ -359,6 +355,13 @@ export const LiveFleetMap: React.FC<LiveFleetMapProps> = ({
       );
 
       const isReal = row.device_id === 'GW-001';
+      const locationText =
+        row.lat != null && row.lng != null && !isNaN(Number(row.lat)) && !isNaN(Number(row.lng))
+          ? row.connectivity === 'OFFLINE'
+            ? `${row.address ? row.address + ' · ' : ''}Last GPS: ${Number(row.lat).toFixed(4)}, ${Number(row.lng).toFixed(4)}`
+            : row.address || `${Number(row.lat).toFixed(4)}, ${Number(row.lng).toFixed(4)}`
+          : 'Awaiting Initial GNSS Fix · Standby';
+
       const popupHtml = `
         <div style="font-family:DM Sans,sans-serif;min-width:215px;font-size:12px;">
           <div style="font-weight:700;color:#0f172a;display:flex;align-items:center;justify-content:space-between;">
@@ -368,7 +371,7 @@ export const LiveFleetMap: React.FC<LiveFleetMapProps> = ({
           <div style="margin-top:3px;font-size:11px;font-weight:600;color:${profile.accentHex};">
             ${profile.vehicleClassLabel} · ${row.cargo_type}
           </div>
-          <div style="margin-top:4px;color:#475569;font-size:11px;">${row.address || 'Financial District / Gachibowli, Hyderabad'}</div>
+          <div style="margin-top:4px;color:#475569;font-size:11px;">${locationText}</div>
           ${isReal ? '<div style="margin-top:3px;color:#0284c7;font-size:10px;font-family:IBM Plex Mono,monospace;">IMEI: 860738070471994 · GPS Acc: ±20.4m</div>' : ''}
           <div style="margin-top:6px;display:flex;justify-content:space-between;font-family:IBM Plex Mono,monospace;">
             <span>Temp: ${row.current_temp_c !== null && row.current_temp_c !== undefined ? `<strong style="color:${row.status === 'EXCURSION' ? '#e11d48' : '#1d4ed8'}">${row.current_temp_c.toFixed(2)}°C</strong>` : '<strong style="color:#d97706">--.-°C (Probe Standby)</strong>'}</span>
@@ -390,6 +393,9 @@ export const LiveFleetMap: React.FC<LiveFleetMapProps> = ({
           .bindPopup(popupHtml);
         marker.on('click', () => {
           onSelectDevice?.(row.device_id);
+          if (row.lat != null && row.lng != null && (map as any)._loaded) {
+            map.flyTo([row.lat, row.lng], 13, { animate: true, duration: 0.8 });
+          }
         });
         markersRef.current.set(row.device_id, marker);
       }
@@ -402,13 +408,30 @@ export const LiveFleetMap: React.FC<LiveFleetMapProps> = ({
       }
     }
 
-    if (mode === 'live' && activeRows.length === 1 && activeRows[0].lat != null && activeRows[0].lng != null) {
+    const selRow = selectedDeviceId ? fleetRows.find((r) => r.device_id === selectedDeviceId) : null;
+    const selectionChanged = prevSelectedDeviceRef.current !== selectedDeviceId;
+    prevSelectedDeviceRef.current = selectedDeviceId;
+
+    if (selectionChanged && selRow && selRow.lat != null && selRow.lng != null && !isNaN(Number(selRow.lat)) && !isNaN(Number(selRow.lng)) && (map as any)._loaded) {
+      map.flyTo([selRow.lat, selRow.lng], 13, { animate: true, duration: 0.8 });
+      const m = markersRef.current.get(selRow.device_id);
+      if (m) {
+        setTimeout(() => m.openPopup(), 400);
+      }
+    } else if (mode === 'live' && activeRows.length === 1 && activeRows[0].lat != null && activeRows[0].lng != null && !isNaN(Number(activeRows[0].lat)) && !isNaN(Number(activeRows[0].lng))) {
       if ((map as any)._loaded) {
         map.panTo([activeRows[0].lat, activeRows[0].lng], { animate: false });
       }
     } else if (!hasCenteredRef.current && activeRows.length > 0) {
-      const bounds = L.latLngBounds(activeRows.map((r) => [r.lat, r.lng]));
-      map.fitBounds(bounds, { padding: [55, 55], maxZoom: 11 });
+      const validCoords = activeRows
+        .filter((r) => r.lat != null && r.lng != null && !isNaN(Number(r.lat)) && !isNaN(Number(r.lng)))
+        .map((r) => [r.lat, r.lng] as [number, number]);
+      if (validCoords.length > 0) {
+        const bounds = L.latLngBounds(validCoords);
+        map.fitBounds(bounds, { padding: [55, 55], maxZoom: 11 });
+      } else {
+        map.setView([17.4483, 78.415], 12);
+      }
       hasCenteredRef.current = true;
     }
   }, [fleetRows, mode, selectedDeviceId, onSelectDevice]);
@@ -444,13 +467,17 @@ export const LiveFleetMap: React.FC<LiveFleetMapProps> = ({
       }
     }
 
-    if (mode === 'live' && liveHistory.length > 1) {
-      const coords = liveHistory.map((p) => [p.lat, p.lng] as [number, number]);
-      L.polyline(coords, {
-        color: '#2563eb',
-        weight: 4,
-        opacity: 0.85,
-      }).addTo(group);
+    if (mode !== 'trip' && liveHistory.length > 1) {
+      const coords = liveHistory
+        .filter((p) => p.lat != null && p.lng != null && !isNaN(Number(p.lat)) && !isNaN(Number(p.lng)))
+        .map((p) => [p.lat, p.lng] as [number, number]);
+      if (coords.length > 1) {
+        L.polyline(coords, {
+          color: '#2563eb',
+          weight: 4,
+          opacity: 0.85,
+        }).addTo(group);
+      }
     }
 
     // Daily Cumulative Multi-Trip Route with Gap Connectors (for Live Tracking)
@@ -459,7 +486,11 @@ export const LiveFleetMap: React.FC<LiveFleetMapProps> = ({
       for (let i = 0; i < dailyLegs.length; i++) {
         const leg = dailyLegs[i];
         if (!leg.waypoints || leg.waypoints.length === 0) continue;
-        const coords = leg.waypoints.map((w) => [w.lat, w.lng] as [number, number]);
+        const validLegWps = leg.waypoints.filter(
+          (w) => w.lat != null && w.lng != null && !isNaN(Number(w.lat)) && !isNaN(Number(w.lng))
+        );
+        if (validLegWps.length === 0) continue;
+        const coords = validLegWps.map((w) => [w.lat, w.lng] as [number, number]);
         const legColor = LEG_COLORS[i % LEG_COLORS.length];
 
         // Layer 1: White casing
@@ -483,8 +514,8 @@ export const LiveFleetMap: React.FC<LiveFleetMapProps> = ({
           .addTo(group);
 
         // Leg Start and End dots
-        const legStart = leg.waypoints[0];
-        const legEnd = leg.waypoints[leg.waypoints.length - 1];
+        const legStart = validLegWps[0];
+        const legEnd = validLegWps[validLegWps.length - 1];
         L.circleMarker([legStart.lat, legStart.lng], {
           radius: 5,
           color: '#ffffff',
@@ -509,17 +540,22 @@ export const LiveFleetMap: React.FC<LiveFleetMapProps> = ({
         if (i < dailyLegs.length - 1) {
           const nextLeg = dailyLegs[i + 1];
           if (nextLeg.waypoints && nextLeg.waypoints.length > 0) {
-            const nextStart = nextLeg.waypoints[0];
-            const distM = Math.hypot(nextStart.lat - legEnd.lat, nextStart.lng - legEnd.lng) * 111000;
-            if (distM > 60) {
-              L.polyline([[legEnd.lat, legEnd.lng], [nextStart.lat, nextStart.lng]], {
-                color: '#64748b',
-                weight: 3,
-                dashArray: '6, 8',
-                opacity: 0.85,
-              })
-                .bindTooltip(`Transit Gap: ${leg.destination} → ${nextLeg.origin}`)
-                .addTo(group);
+            const nextValid = nextLeg.waypoints.filter(
+              (w) => w.lat != null && w.lng != null && !isNaN(Number(w.lat)) && !isNaN(Number(w.lng))
+            );
+            if (nextValid.length > 0) {
+              const nextStart = nextValid[0];
+              const distM = Math.hypot(nextStart.lat - legEnd.lat, nextStart.lng - legEnd.lng) * 111000;
+              if (distM > 60) {
+                L.polyline([[legEnd.lat, legEnd.lng], [nextStart.lat, nextStart.lng]], {
+                  color: '#64748b',
+                  weight: 3,
+                  dashArray: '6, 8',
+                  opacity: 0.85,
+                })
+                  .bindTooltip(`Transit Gap: ${leg.destination} → ${nextLeg.origin}`)
+                  .addTo(group);
+              }
             }
           }
         }
@@ -528,9 +564,12 @@ export const LiveFleetMap: React.FC<LiveFleetMapProps> = ({
       // Check gap between last leg end and current vehicle location:
       const lastLeg = dailyLegs[dailyLegs.length - 1];
       if (lastLeg.waypoints && lastLeg.waypoints.length > 0 && selectedDeviceId) {
+        const lastValid = lastLeg.waypoints.filter(
+          (w) => w.lat != null && w.lng != null && !isNaN(Number(w.lat)) && !isNaN(Number(w.lng))
+        );
         const selRow = fleetRows.find((r) => r.device_id === selectedDeviceId);
-        if (selRow && selRow.lat != null && selRow.lng != null) {
-          const lastPoint = lastLeg.waypoints[lastLeg.waypoints.length - 1];
+        if (lastValid.length > 0 && selRow && selRow.lat != null && selRow.lng != null && !isNaN(Number(selRow.lat)) && !isNaN(Number(selRow.lng))) {
+          const lastPoint = lastValid[lastValid.length - 1];
           const distM = Math.hypot(selRow.lat - lastPoint.lat, selRow.lng - lastPoint.lng) * 111000;
           if (distM > 80) {
             L.polyline([[lastPoint.lat, lastPoint.lng], [selRow.lat, selRow.lng]], {
@@ -547,112 +586,119 @@ export const LiveFleetMap: React.FC<LiveFleetMapProps> = ({
     }
 
     if (mode === 'trip' && tripWaypoints.length > 0) {
-      const allCoords = tripWaypoints.map((w) => [w.lat, w.lng] as [number, number]);
-      // Base / Planned full route: Clean solid slate line without dots
-      L.polyline(allCoords, {
-        color: '#94a3b8',
-        weight: 4,
-        opacity: 0.75,
-        lineCap: 'round',
-        lineJoin: 'round',
-      }).addTo(group);
-
-      const safeIdx = Math.min(tripWaypoints.length - 1, Math.max(0, replayIndex));
-      const traveled = allCoords.slice(0, safeIdx + 1);
-      if (traveled.length > 1) {
-        // Layer 1: Underlay white casing border (7px) for high-contrast on any terrain
-        L.polyline(traveled, {
-          color: '#ffffff',
-          weight: 7,
-          opacity: 0.95,
+      const validTripWaypoints = tripWaypoints.filter(
+        (w) => w.lat != null && w.lng != null && !isNaN(Number(w.lat)) && !isNaN(Number(w.lng))
+      );
+      if (validTripWaypoints.length > 0) {
+        const allCoords = validTripWaypoints.map((w) => [w.lat, w.lng] as [number, number]);
+        // Base / Planned full route: Clean solid slate line without dots
+        L.polyline(allCoords, {
+          color: '#94a3b8',
+          weight: 4,
+          opacity: 0.75,
           lineCap: 'round',
           lineJoin: 'round',
         }).addTo(group);
 
-        // Layer 2: Traveled / Replay path in High-visibility Deep Royal Blue (#1d4ed8, 5px, solid)
-        L.polyline(traveled, {
-          color: '#1d4ed8',
-          weight: 5,
-          opacity: 1.0,
-          lineCap: 'round',
-          lineJoin: 'round',
-        }).addTo(group);
-      }
+        const safeIdx = Math.min(validTripWaypoints.length - 1, Math.max(0, replayIndex));
+        const traveled = allCoords.slice(0, safeIdx + 1);
+        if (traveled.length > 1) {
+          // Layer 1: Underlay white casing border (7px) for high-contrast on any terrain
+          L.polyline(traveled, {
+            color: '#ffffff',
+            weight: 7,
+            opacity: 0.95,
+            lineCap: 'round',
+            lineJoin: 'round',
+          }).addTo(group);
 
-      const origin = tripWaypoints[0];
-      const dest = tripWaypoints[tripWaypoints.length - 1];
+          // Layer 2: Traveled / Replay path in High-visibility Deep Royal Blue (#1d4ed8, 5px, solid)
+          L.polyline(traveled, {
+            color: '#1d4ed8',
+            weight: 5,
+            opacity: 1.0,
+            lineCap: 'round',
+            lineJoin: 'round',
+          }).addTo(group);
+        }
 
-      // Origin Pin (Point A - Green circle with white "A")
-      L.marker([origin.lat, origin.lng], {
-        icon: L.divIcon({
-          className: 'trip-pin-marker',
-          html: `<div style="background:#15803d;color:#ffffff;font-size:11px;font-weight:bold;width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;border:2px solid #ffffff;box-shadow:0 2px 5px rgba(0,0,0,0.3);">A</div>`,
-          iconSize: [22, 22],
-          iconAnchor: [11, 11],
-        }),
-      })
-        .bindTooltip(`Trip Origin (Start Point A)`)
-        .addTo(group);
+        const origin = validTripWaypoints[0];
+        const dest = validTripWaypoints[validTripWaypoints.length - 1];
 
-      // Destination Pin (Point B - Red circle with white "B")
-      L.marker([dest.lat, dest.lng], {
-        icon: L.divIcon({
-          className: 'trip-pin-marker',
-          html: `<div style="background:#dc2626;color:#ffffff;font-size:11px;font-weight:bold;width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;border:2px solid #ffffff;box-shadow:0 2px 5px rgba(0,0,0,0.3);">B</div>`,
-          iconSize: [22, 22],
-          iconAnchor: [11, 11],
-        }),
-      })
-        .bindTooltip(`Destination (Arrival Point B)`)
-        .addTo(group);
-
-      const currentWp = tripWaypoints[safeIdx];
-      const wpTemp =
-        currentWp.cargo_temp_c !== null &&
-        currentWp.cargo_temp_c !== undefined &&
-        !isNaN(Number(currentWp.cargo_temp_c))
-          ? Number(currentWp.cargo_temp_c)
-          : null;
-      const wpStatus =
-        wpTemp !== null
-          ? wpTemp > 8
-            ? 'EXCURSION'
-            : wpTemp >= 7
-              ? 'WARNING'
-              : 'OPTIMAL'
-          : 'OPTIMAL';
-
-      const tripConnectivity = focusedConnectivity === 'ONLINE' ? 'ONLINE' : 'OFFLINE';
-      L.marker([currentWp.lat, currentWp.lng], {
-        icon: createVehicleMarkerIcon(
-          focusedLabel,
-          focusedVehicleName,
-          focusedCargoType,
-          wpTemp,
-          wpStatus,
-          tripConnectivity,
-          currentWp.heading_deg,
-          true
-        ),
-      }).addTo(group);
-
-      for (const h of tripHalts) {
-        L.circleMarker([h.lat, h.lng], {
-          radius: 7,
-          color: '#ffffff',
-          fillColor: '#f59e0b',
-          fillOpacity: 0.95,
-          weight: 2,
+        // Origin Pin (Point A - Green circle with white "A")
+        L.marker([origin.lat, origin.lng], {
+          icon: L.divIcon({
+            className: 'trip-pin-marker',
+            html: `<div style="background:#15803d;color:#ffffff;font-size:11px;font-weight:bold;width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;border:2px solid #ffffff;box-shadow:0 2px 5px rgba(0,0,0,0.3);">A</div>`,
+            iconSize: [22, 22],
+            iconAnchor: [11, 11],
+          }),
         })
-          .bindTooltip(`Halt: ${h.location_name} (${h.duration_minutes}m)`)
+          .bindTooltip(`Trip Origin (Start Point A)`)
           .addTo(group);
-      }
 
-      const tripKey = `${tripWaypoints.length}_${tripWaypoints[0]?.lat}_${tripWaypoints[tripWaypoints.length - 1]?.lat}`;
-      if (hasFittedTripRef.current !== tripKey) {
-        const bounds = L.latLngBounds(allCoords);
-        map.fitBounds(bounds, { padding: [55, 55], maxZoom: 11 });
-        hasFittedTripRef.current = tripKey;
+        // Destination Pin (Point B - Red circle with white "B")
+        L.marker([dest.lat, dest.lng], {
+          icon: L.divIcon({
+            className: 'trip-pin-marker',
+            html: `<div style="background:#dc2626;color:#ffffff;font-size:11px;font-weight:bold;width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;border:2px solid #ffffff;box-shadow:0 2px 5px rgba(0,0,0,0.3);">B</div>`,
+            iconSize: [22, 22],
+            iconAnchor: [11, 11],
+          }),
+        })
+          .bindTooltip(`Destination (Arrival Point B)`)
+          .addTo(group);
+
+        const currentWp = validTripWaypoints[safeIdx];
+        const wpTemp =
+          currentWp.cargo_temp_c !== null &&
+            currentWp.cargo_temp_c !== undefined &&
+            !isNaN(Number(currentWp.cargo_temp_c))
+            ? Number(currentWp.cargo_temp_c)
+            : null;
+        const wpStatus =
+          wpTemp !== null
+            ? wpTemp > 8
+              ? 'EXCURSION'
+              : wpTemp >= 7
+                ? 'WARNING'
+                : 'OPTIMAL'
+            : 'OPTIMAL';
+
+        const tripConnectivity = focusedConnectivity === 'ONLINE' ? 'ONLINE' : 'OFFLINE';
+        L.marker([currentWp.lat, currentWp.lng], {
+          icon: createVehicleMarkerIcon(
+            focusedLabel,
+            focusedVehicleName,
+            focusedCargoType,
+            wpTemp,
+            wpStatus,
+            tripConnectivity,
+            currentWp.heading_deg,
+            true
+          ),
+        }).addTo(group);
+
+        for (const h of tripHalts) {
+          if (h.lat != null && h.lng != null && !isNaN(Number(h.lat)) && !isNaN(Number(h.lng))) {
+            L.circleMarker([h.lat, h.lng], {
+              radius: 7,
+              color: '#ffffff',
+              fillColor: '#f59e0b',
+              fillOpacity: 0.95,
+              weight: 2,
+            })
+              .bindTooltip(`Halt: ${h.location_name} (${h.duration_minutes}m)`)
+              .addTo(group);
+          }
+        }
+
+        const tripKey = `${validTripWaypoints.length}_${validTripWaypoints[0]?.lat}_${validTripWaypoints[validTripWaypoints.length - 1]?.lat}`;
+        if (hasFittedTripRef.current !== tripKey) {
+          const bounds = L.latLngBounds(allCoords);
+          map.fitBounds(bounds, { padding: [55, 55], maxZoom: 11 });
+          hasFittedTripRef.current = tripKey;
+        }
       }
     }
   }, [
@@ -673,44 +719,50 @@ export const LiveFleetMap: React.FC<LiveFleetMapProps> = ({
     <div className={`relative w-full overflow-hidden rounded-xl border border-slate-300 ${heightClass}`}>
       <div ref={containerRef} className="h-full w-full" />
 
-      <div className="absolute right-2.5 top-2.5 z-[500] flex flex-wrap items-center gap-2">
-        {/* Quick Zoom & Corridor Controls */}
+      {/* GPS Standby Overlay when vehicle has no GPS fix yet */}
+      {mode !== 'trip' && fleetRows.length > 0 && fleetRows.every((r) => r.lat == null) && (
+        <div className="absolute top-2 left-2 z-[500] pointer-events-none rounded-lg bg-white/95 px-3 py-1.5 shadow-md border border-amber-300 font-mono text-xs text-amber-900 flex items-center gap-2 backdrop-blur">
+          <span className="h-2 w-2 rounded-full bg-amber-500 animate-pulse"></span>
+          <span>Awaiting GNSS Fix · Vehicle Registered in Standby</span>
+        </div>
+      )}
+
+      <div className="absolute right-2 top-2 z-[500] flex flex-nowrap items-center gap-1.5 max-w-[98%]">
+        {/* Quick Zoom & Fit Controls */}
         <div className="flex items-center rounded-lg border border-slate-300 bg-white/95 p-0.5 text-[11px] font-semibold text-slate-700 shadow-md backdrop-blur">
           <button
             type="button"
             onClick={handleZoomIn}
             title="Zoom In (+)"
-            className="flex items-center gap-0.5 rounded-md px-2 py-1 text-slate-700 hover:bg-slate-100 cursor-pointer"
+            className="flex items-center justify-center rounded-md p-1 text-slate-700 hover:bg-slate-100 cursor-pointer"
           >
-            <ZoomIn className="h-3 w-3" />
-            <span>In</span>
+            <ZoomIn className="h-3.5 w-3.5" />
           </button>
           <button
             type="button"
             onClick={handleZoomOut}
             title="Zoom Out (-)"
-            className="flex items-center gap-0.5 rounded-md px-2 py-1 text-slate-700 hover:bg-slate-100 cursor-pointer"
+            className="flex items-center justify-center rounded-md p-1 text-slate-700 hover:bg-slate-100 cursor-pointer"
           >
-            <ZoomOut className="h-3 w-3" />
-            <span>Out</span>
+            <ZoomOut className="h-3.5 w-3.5" />
           </button>
-          <div className="mx-1 h-3.5 w-[1px] bg-slate-200" />
-          <button
-            type="button"
-            onClick={handleRegionalZoomOut}
-            title="Regional Corridor Overview (Zoom Out to show Sangareddy to Hyderabad)"
-            className="flex items-center gap-1 rounded-md px-2 py-1 text-blue-700 hover:bg-blue-50 font-bold cursor-pointer whitespace-nowrap"
-          >
-            <Maximize2 className="h-3 w-3" />
-            <span>Regional View</span>
-          </button>
+          <div className="mx-0.5 h-3.5 w-[1px] bg-slate-200" />
           <button
             type="button"
             onClick={handleFitRoute}
-            title="Fit Route Waypoints"
-            className="rounded-md px-2 py-1 text-slate-600 hover:bg-slate-100 cursor-pointer whitespace-nowrap"
+            title="Fit Route / Fleet"
+            className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-slate-700 hover:bg-slate-100 cursor-pointer whitespace-nowrap text-[11px]"
           >
-            Fit Route
+            <Maximize2 className="h-3 w-3 text-blue-600" />
+            <span>Fit</span>
+          </button>
+          <button
+            type="button"
+            onClick={handleRegionalZoomOut}
+            title="Regional Corridor Overview (Sangareddy to Hyderabad)"
+            className="hidden sm:flex items-center gap-1 rounded-md px-1.5 py-0.5 text-blue-700 hover:bg-blue-50 font-bold cursor-pointer whitespace-nowrap text-[11px]"
+          >
+            <span>Corridor</span>
           </button>
         </div>
 
@@ -718,20 +770,20 @@ export const LiveFleetMap: React.FC<LiveFleetMapProps> = ({
         <div
           role="group"
           aria-label="Map layer style"
-          className="flex items-center rounded-lg border border-slate-300 bg-white/95 p-0.5 text-[11px] font-semibold text-slate-700 shadow-md backdrop-blur"
+          className="flex items-center rounded-lg border border-slate-300 bg-white/95 p-0.5 text-[11px] font-semibold text-slate-700 shadow-md backdrop-blur shrink-0"
         >
           {(
             [
               ['street', 'Map'],
-              ['satellite', 'Satellite'],
-              ['osm', 'Street OSM'],
+              ['satellite', 'Sat'],
+              ['osm', 'OSM'],
             ] as const
           ).map(([id, label]) => (
             <button
               key={id}
               type="button"
               onClick={() => setMapStyle(id)}
-              className={`rounded-md px-2 py-1 transition-colors cursor-pointer ${
+              className={`rounded-md px-1.5 py-0.5 transition-colors cursor-pointer text-[11px] ${
                 mapStyle === id
                   ? 'bg-blue-600 text-white font-bold'
                   : 'text-slate-700 hover:bg-slate-100'

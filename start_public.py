@@ -38,53 +38,29 @@ if not os.path.exists(PYTHON_EXE):
 CLOUDFLARED_EXE = os.path.join(BASE_DIR, "cloudflared.exe")
 NGROK_EXE = os.path.join(BASE_DIR, "ngrok.exe")
 
-APP_PORT = int(os.environ.get("PORT", 8005))
+APP_PORT = int(os.environ.get("PORT", 8000))
 SUBPROCESS_ENV = {**os.environ, "PORT": str(APP_PORT), "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
 
 def free_port(port=APP_PORT):
-    subprocess.run("taskkill /F /IM cloudflared.exe", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.run("taskkill /F /IM ngrok.exe", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    try:
-        subprocess.run(["powershell", "-NoProfile", "-Command", "Stop-Process -Name ngrok -Force -ErrorAction SilentlyContinue"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
-    # Kill any stale python processes running run_tracx.py
-    try:
-        ps_cmd = (
-            "Get-CimInstance Win32_Process -Filter \"Name like 'python%'\" | "
-            "Where-Object { $_.CommandLine -like '*run_tracx.py*' } | "
-            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
-        )
-        subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
-
-    for _ in range(3):
-        pids = []
+    for im in ["cloudflared.exe", "ngrok.exe"]:
         try:
-            output = subprocess.check_output(f"netstat -ano | findstr :{port}", shell=True, text=True, stderr=subprocess.DEVNULL)
-            for line in output.strip().splitlines():
-                parts = line.strip().split()
-                if len(parts) >= 5 and "LISTENING" in parts:
-                    pid = int(parts[-1])
-                    if pid != os.getpid() and pid not in pids and pid > 4:
-                        pids.append(pid)
+            subprocess.run(["taskkill", "/F", "/IM", im], capture_output=True, timeout=2)
         except Exception:
-            break
-
-        if not pids:
-            break
-
-        for pid in pids:
-            try:
-                chk = subprocess.run(f'tasklist /FI "PID eq {pid}"', shell=True, capture_output=True, text=True)
-                if str(pid) in chk.stdout:
-                    print(f"Cleaning existing process on port {port} (PID {pid}) ...", flush=True)
-                    subprocess.run(f"taskkill /F /T /PID {pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    subprocess.run(["powershell", "-NoProfile", "-Command", f"Stop-Process -Id {pid} -Force -ErrorAction SilentlyContinue"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except Exception:
-                pass
-        time.sleep(1)
+            pass
+    try:
+        proc = subprocess.run(["netstat", "-ano"], capture_output=True, text=True, timeout=3)
+        for line in proc.stdout.splitlines():
+            if f":{port}" in line and "LISTENING" in line:
+                parts = line.strip().split()
+                if len(parts) >= 5:
+                    pid = int(parts[-1])
+                    if pid > 4 and pid != os.getpid():
+                        try:
+                            subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=2)
+                        except Exception:
+                            pass
+    except Exception:
+        pass
 
 def is_backend_ready(port=APP_PORT):
     try:

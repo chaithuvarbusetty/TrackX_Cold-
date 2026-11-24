@@ -78,3 +78,23 @@ export function playAlertTone(kind: 'temp_critical' | 'door_tamper' | 'resolved'
     osc.stop(start + 0.14);
   });
 }
+
+export function playPacketTick(isAlert: boolean = false): void {
+  if (isAudioMuted()) return;
+  const ctx = initAudioContext();
+  if (!ctx) return;
+  try {
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(isAlert ? 980 : 1320, now);
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(0.015, now + 0.008);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.055);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(now);
+    osc.stop(now + 0.06);
+  } catch {}
+}

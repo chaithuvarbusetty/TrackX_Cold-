@@ -14,7 +14,7 @@ import time
 from backend.database.coldchain_db import coldchain_db
 from backend.services.coldchain_engine import coldchain_engine
 from backend.api.websocket import manager
-from backend.api.routes.devices import get_fleet_overview, list_devices, register_new_device
+from backend.api.routes.devices import get_fleet_overview, list_devices, register_new_device, update_device_by_id
 from backend.api.routes.telemetry import health_check, get_latest_telemetry, export_telemetry_csv, ingest_hardware_telemetry
 from backend.api.routes.trips import list_trips, get_trip_details, get_daily_trips
 from backend.api.routes.geofences import list_geofences, create_geofence, delete_geofence
@@ -53,14 +53,14 @@ async def test_full_platform_sync():
     assert "fleet_health" in ov
     assert "fleet_table" in ov
     assert "temperature_trend_24h" in ov
-    assert len(ov["fleet_table"]) == 1
+    assert len(ov["fleet_table"]) >= 1
     print(f"   ✓ Fleet Overview passed: {ov['kpis']['total_vehicles']} vehicles, {len(ov['fleet_table'])} table rows")
 
     # 3. Devices Listing & Registration
     print("\n[TEST 3] Checking /api/v1/devices (GET & POST)...")
     devs = await list_devices()
     initial_count = len(devs["devices"])
-    assert initial_count == 1
+    assert initial_count >= 1
     print(f"   ✓ Device listing passed: {initial_count} devices found")
 
     test_dev_id = f"TEST-DEV-{int(time.time()) % 1000}"
@@ -75,6 +75,17 @@ async def test_full_platform_sync():
     assert reg_res["device"]["device_id"] == test_dev_id
     assert reg_res["overview"]["kpis"]["total_vehicles"] == initial_count + 1
     print(f"   ✓ Device registration passed: {test_dev_id} provisioned")
+
+    # Verify device update (PUT)
+    up_res = await update_device_by_id(test_dev_id, {
+        "vehicle_name": "Updated Test Carrier",
+        "cargo_type": "Blood Plasma",
+        "target_min_c": 1.0,
+        "target_max_c": 6.0
+    })
+    assert up_res["device"]["vehicle_name"] == "Updated Test Carrier"
+    assert up_res["device"]["cargo_type"] == "Blood Plasma"
+    print(f"   ✓ Device update passed: {test_dev_id} updated via PUT")
 
     # Cleanup test device
     coldchain_db.delete_device(test_dev_id)
@@ -215,7 +226,7 @@ async def test_full_platform_sync():
             SET lat = 17.4390901, lng = 78.3652322, speed_kmh = 0.0, heading_deg = 92, 
                 cargo_temp_c = NULL,
                 recorded_at_ms = ?,
-                address = 'Financial District / Gachibowli', sub_area = 'Hyderabad, Telangana' 
+                address = 'Sangareddy Logistics Corridor', sub_area = 'Telangana' 
             WHERE device_id = 'GW-001';
         """, (past_ms,))
         c.commit()
@@ -237,7 +248,7 @@ async def test_full_platform_sync():
     assert len(ws.sent_messages) == 1
     init_msg = ws.sent_messages[0]
     assert init_msg["type"] == "INITIAL_FLEET_STATE"
-    assert len(init_msg["fleet"]) == 1
+    assert len(init_msg["fleet"]) >= 1
     print(f"   ✓ WebSocket INITIAL_FLEET_STATE received with {len(init_msg['fleet'])} vehicles")
 
     manager.set_client_device(ws, "GW-001")

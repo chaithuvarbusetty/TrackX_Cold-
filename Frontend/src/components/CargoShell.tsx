@@ -208,6 +208,7 @@ interface OperationsDrawerProps {
   open: boolean;
   onClose: () => void;
   alerts: AlertItem[];
+  activeAlertCount?: number;
   fleetRows: FleetTableRow[];
   diagnostics: DbDiagnosticsPayload | null;
   onUpdateAlertStatus: (alertId: string, status: AlertStatus) => Promise<void>;
@@ -244,6 +245,7 @@ export const OperationsDrawer: React.FC<OperationsDrawerProps> = ({
   open,
   onClose,
   alerts,
+  activeAlertCount,
   fleetRows,
   diagnostics,
   onUpdateAlertStatus,
@@ -534,7 +536,7 @@ export const OperationsDrawer: React.FC<OperationsDrawerProps> = ({
                     : 'text-slate-600 hover:text-slate-900'
                 }`}
               >
-                Alerts ({alerts.filter((a) => a.status === 'Active').length})
+                Alerts ({activeAlertCount !== undefined ? activeAlertCount : alerts.filter((a) => a.status === 'Active').length})
               </button>
               <button
                 type="button"

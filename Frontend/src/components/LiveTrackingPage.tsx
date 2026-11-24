@@ -1,11 +1,11 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { ArrowUpRight, Box, Download, Navigation } from 'lucide-react';
 import type {
-  DailyTripLeg,
   FleetOverviewPayload,
   FleetTableRow,
   GeofenceRecord,
   ModuleId,
+  TelemetryPoint,
 } from '../shared/types';
 import { getVehicleCargoProfile, type VehicleBodyType } from '../utils/vehicleCargo';
 import { LiveFleetMap } from './LiveFleetMap';
@@ -24,6 +24,7 @@ interface LiveTrackingPageProps {
   onNavigateModule: (mod: ModuleId, openDetail?: boolean) => void;
   onExportCsv: (deviceId: string) => void;
   geofences: GeofenceRecord[];
+  liveHistory?: TelemetryPoint[];
 }
 
 const VEHICLE_SHAPE_LEGEND: Array<{
@@ -65,58 +66,49 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
   onNavigateModule,
   onExportCsv,
   geofences,
+  liveHistory = [],
 }) => {
   const { kpis, fleet_table } = overview;
   const focused: FleetTableRow | undefined =
     fleet_table.find((r) => r.device_id === selectedDeviceId) ?? fleet_table[0];
 
   const [viewMode, setViewMode] = useState<'map' | '3d' | 'split'>('map');
-  const [dailyLegs, setDailyLegs] = useState<DailyTripLeg[]>([]);
 
   const liveTelemetry = useMemo(() => {
     if (!focused) return undefined;
-    const temp =
-      focused.current_temp_c != null && !isNaN(Number(focused.current_temp_c))
-        ? Number(focused.current_temp_c)
-        : 29.0;
+    const hasValidTemp =
+      focused.current_temp_c != null &&
+      !isNaN(Number(focused.current_temp_c));
+    const temp = hasValidTemp ? Number(focused.current_temp_c) : null;
     const maxT = focused.target_max_c ?? 8.0;
     const minT = focused.target_min_c ?? 2.0;
     const tempBand =
-      temp > maxT ? 'above_critical' : temp < minT ? 'below_critical' : 'optimal';
+      temp == null
+        ? 'optimal'
+        : temp > maxT
+          ? 'above_critical'
+          : temp < minT
+            ? 'below_critical'
+            : 'optimal';
     const isAlert =
-      focused.status === 'EXCURSION' || temp > maxT || focused.security === 'OPEN';
+      focused.status === 'EXCURSION' ||
+      (temp != null && (temp > maxT || temp < minT)) ||
+      focused.security === 'OPEN';
+    const speed = focused.speed_kmh != null && !isNaN(Number(focused.speed_kmh)) ? Number(focused.speed_kmh) : 0;
     return {
       callsign: focused.device_id,
       temperatureC: temp,
       tempBand: tempBand as 'optimal' | 'above_critical' | 'below_critical',
       doorState: (focused.security === 'OPEN' ? 'open' : 'closed') as 'open' | 'closed',
       compressorActive: focused.compressor_active ?? true,
-      speedKmh: focused.speed_kmh != null ? Number(focused.speed_kmh) : 0,
-      vehicleMoving: (focused.speed_kmh ?? 0) > 1.0,
+      speedKmh: speed,
+      vehicleMoving: speed > 1.0,
       isAlertActive: isAlert,
       isDoorTampered: focused.security === 'OPEN',
       accentHex: 0x2563eb,
       cutawayEnabled: false,
     };
   }, [focused]);
-
-  useEffect(() => {
-    if (!selectedDeviceId) return;
-    let cancelled = false;
-    fetch(`/api/v1/trips/daily/${encodeURIComponent(selectedDeviceId)}`, {
-      headers: { 'ngrok-skip-browser-warning': 'true' },
-    })
-      .then((r) => r.json())
-      .then((data) => {
-        if (!cancelled && data.legs) {
-          setDailyLegs(data.legs);
-        }
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, [selectedDeviceId]);
 
   return (
     <div className="space-y-6">
@@ -217,14 +209,6 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                   Split View
                 </button>
               </div>
-
-              <div className="hidden sm:flex items-center gap-2 text-xs font-medium text-slate-600 pl-2">
-                <span className="text-emerald-700">Optimal (&lt;7.0°C)</span>
-                <span aria-hidden="true">·</span>
-                <span className="text-amber-600">Warn (≥7.0°C)</span>
-                <span aria-hidden="true">·</span>
-                <span className="text-rose-600">Crit (&gt;8.0°C)</span>
-              </div>
             </div>
           </div>
 
@@ -235,7 +219,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
               selectedDeviceId={selectedDeviceId}
               onSelectDevice={onSelectDevice}
               geofences={geofences}
-              dailyLegs={dailyLegs}
+              liveHistory={liveHistory}
               heightClass="h-[395px]"
             />
           )}
@@ -256,7 +240,7 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                 selectedDeviceId={selectedDeviceId}
                 onSelectDevice={onSelectDevice}
                 geofences={geofences}
-                dailyLegs={dailyLegs}
+                liveHistory={liveHistory}
                 heightClass="h-[395px]"
               />
               <Viewport3D
@@ -264,27 +248,6 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                 telemetry={liveTelemetry}
                 heightClass="h-[395px]"
               />
-            </div>
-          )}
-
-          {dailyLegs.length > 0 && (
-            <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-lg border border-slate-200 bg-slate-50/80 px-3 py-2 text-xs">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="font-semibold text-slate-700">Today's Cumulative Traveled Path:</span>
-                {dailyLegs.map((leg, idx) => (
-                  <span
-                    key={leg.trip_id}
-                    className="inline-flex items-center gap-1.5 rounded-md px-2 py-0.5 font-mono text-[11px] font-semibold text-white shadow-2xs"
-                    style={{ backgroundColor: ['#1d4ed8', '#059669', '#7c3aed', '#d97706'][idx % 4] }}
-                  >
-                    Leg {idx + 1}: {leg.origin} → {leg.destination} ({Number(leg.total_distance_km).toFixed(1)} km)
-                  </span>
-                ))}
-              </div>
-              <div className="flex items-center gap-1.5 font-mono text-[11px] text-slate-500">
-                <span className="inline-block w-4 border-b-2 border-dashed border-slate-500"></span>
-                <span>Transit Gap / Off-Manifest</span>
-              </div>
             </div>
           )}
 
@@ -308,14 +271,21 @@ export const LiveTrackingPage: React.FC<LiveTrackingPageProps> = ({
                     vehicleName={focused.vehicle_name}
                     cargoType={focused.cargo_type}
                   />
+                  {focused.lat == null && (
+                    <span className="inline-flex items-center gap-1 rounded bg-amber-50 px-2 py-0.5 text-[10px] font-bold text-amber-800 border border-amber-300 shadow-2xs">
+                      <span className="h-1.5 w-1.5 rounded-full bg-amber-500 animate-pulse"></span>
+                      GNSS Standby · Awaiting Fix
+                    </span>
+                  )}
                 </div>
                 <div className="flex flex-wrap items-center gap-3 font-mono text-[11px] text-slate-700 tabular-nums">
                   <span className="inline-flex items-center gap-1 text-slate-900 font-medium">
                     <Navigation className="h-3 w-3 text-blue-600" />
-                    {focused.address || 'Financial District / Gachibowli, Hyderabad'}
-                  </span>
-                  <span>
-                    {focused.lat ? focused.lat.toFixed(4) : '17.4391'}, {focused.lng ? focused.lng.toFixed(4) : '78.3652'}
+                    {focused.lat != null && focused.lng != null
+                      ? focused.connectivity === 'OFFLINE'
+                        ? `${focused.address ? focused.address + ' · ' : ''}Last GPS: ${focused.lat.toFixed(4)}, ${focused.lng.toFixed(4)}`
+                        : focused.address || `${focused.lat.toFixed(4)}, ${focused.lng.toFixed(4)}`
+                      : 'Awaiting Initial GNSS Fix · Standby'}
                   </span>
                   <span>{focused.speed_kmh ? focused.speed_kmh.toFixed(1) : '0.0'} km/h</span>
                   <span>Door: {focused.security === 'OPEN' ? 'BREACH (OPEN)' : 'SEALED'}</span>

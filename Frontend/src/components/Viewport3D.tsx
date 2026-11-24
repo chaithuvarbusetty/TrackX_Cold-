@@ -77,11 +77,12 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
     if (visualState) return visualState;
     const t = telemetry || {};
     const rawTemp = t.temperatureC;
-    const temp = rawTemp !== null && rawTemp !== undefined && !isNaN(Number(rawTemp))
-      ? Number(rawTemp)
-      : 29.0;
-    const tempBand = t.tempBand || (temp > 8.0 ? 'above_critical' : temp < 2.0 ? 'below_critical' : 'optimal');
-    const isAlert = t.isAlertActive ?? (temp > 8.0 || t.doorState === 'open');
+    const hasValidTemp = rawTemp !== null && rawTemp !== undefined && !isNaN(Number(rawTemp));
+    const temp = hasValidTemp ? Number(rawTemp) : null;
+    const tempBand = t.tempBand || (temp == null ? 'optimal' : temp > 8.0 ? 'above_critical' : temp < 2.0 ? 'below_critical' : 'optimal');
+    const isAlert = t.isAlertActive ?? ((temp != null && (temp > 8.0 || temp < 2.0)) || t.doorState === 'open');
+    const speed = t.speedKmh != null && !isNaN(Number(t.speedKmh)) ? Number(t.speedKmh) : 0;
+    const moving = t.vehicleMoving ?? (speed > 1.0);
     return {
       callsign: t.callsign || 'GW-001',
       accentHex: t.accentHex ?? 0x2563eb,
@@ -93,8 +94,8 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
       isAlertActive: isAlert,
       isDoorTampered: t.isDoorTampered ?? (t.doorState === 'open'),
       cameraPreset: t.cameraPreset || (mode === 'thermal' ? 'node' : mode === 'diagnostic' ? 'doors' : 'overview'),
-      vehicleMoving: t.vehicleMoving ?? ((t.speedKmh ?? 0) > 1.0),
-      speedKmh: t.speedKmh != null && !isNaN(Number(t.speedKmh)) ? Number(t.speedKmh) : 0,
+      vehicleMoving: moving,
+      speedKmh: speed,
       trafficDensity: t.trafficDensity || 'moderate',
     };
   }, [visualState, telemetry, mode]);
@@ -374,9 +375,9 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
         </div>
       )}
 
-      {/* Bottom Floating Camera Presets Dock (touch targets >= 44x44 on mobile) */}
+      {/* Bottom Floating Camera Presets Dock */}
       {showControls && (
-        <div className="pointer-events-auto absolute bottom-3 left-1/2 -translate-x-1/2 z-10 flex flex-wrap items-center justify-center gap-1 rounded-xl border border-slate-300/80 bg-white/95 p-1 shadow-md backdrop-blur-xs text-[11px] font-semibold text-slate-700 max-w-[94%]">
+        <div className="pointer-events-auto absolute bottom-2.5 left-1/2 -translate-x-1/2 z-10 flex flex-nowrap items-center justify-center gap-1 rounded-xl border border-slate-300/80 bg-white/95 p-1 shadow-md backdrop-blur-xs text-[10px] sm:text-[11px] font-semibold text-slate-700 max-w-[96%] overflow-x-auto">
           {(
             [
               ['overview', 'Overview'],
@@ -389,7 +390,7 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
               key={preset}
               type="button"
               onClick={() => handleCameraChange(preset)}
-              className={`min-h-[44px] min-w-[44px] sm:min-h-[34px] sm:min-w-0 px-3 py-1 rounded-lg transition-colors cursor-pointer whitespace-nowrap focus-visible:outline-2 focus-visible:outline-blue-600 ${
+              className={`shrink-0 px-2.5 py-1 rounded-lg transition-colors cursor-pointer whitespace-nowrap focus-visible:outline-2 focus-visible:outline-blue-600 ${
                 activePreset === preset
                   ? 'bg-blue-600 text-white shadow-xs'
                   : 'hover:bg-slate-100 text-slate-700'

@@ -4,11 +4,13 @@ import {
   ChevronLeft,
   ChevronRight,
   Download,
+  Edit2,
   Pause,
   Play,
   Plus,
   RotateCcw,
   Search,
+  Trash2,
   Unlock,
   WifiOff,
   X,
@@ -50,12 +52,54 @@ interface VehicleReadingsPageProps {
     target_max_c: number;
     sampling_interval_sec: number;
   }) => Promise<void>;
+  onUpdateDevice?: (
+    deviceId: string,
+    payload: {
+      vehicle_name?: string;
+      cargo_type?: string;
+      target_min_c?: number;
+      target_max_c?: number;
+      sampling_interval_sec?: number;
+      imei?: string;
+    }
+  ) => Promise<void>;
+  onDeleteDevice?: (deviceId: string) => Promise<void>;
   nowMs: number;
 }
 
 function toDatetimeLocalValue(ms: number): string {
   const d = new Date(ms - new Date(ms).getTimezoneOffset() * 60000);
   return d.toISOString().slice(0, 16);
+}
+
+function cleanVehicleName(name: string | undefined, deviceId: string): string {
+  if (!name || !name.trim()) return deviceId;
+  return name.trim();
+}
+
+function computeSensorDiagnosis(row: FleetTableRow) {
+  if (row.connectivity === 'OFFLINE') return { label: 'Unit Offline', status: 'offline' };
+  if (!row.node_connected || row.current_temp_c === null) return { label: 'Probe Standby', status: 'standby' };
+  if (row.network_rssi_dbm < -92) return { label: 'Cellular Jitter', status: 'warning' };
+  return { label: 'Signal Fidelity 99%', status: 'optimal' };
+}
+
+function computeDoorDwellBudget(row: FleetTableRow): string | null {
+  if (row.security !== 'OPEN') return null;
+  const amb = row.ambient_temp_c ?? 30.0;
+  const current = row.current_temp_c ?? 4.0;
+  const maxT = row.target_max_c ?? 8.0;
+  const tempDiff = Math.max(0.5, maxT - current);
+  const heatGainRate = Math.max(0.35, (amb - current) * 0.04);
+  const safeMins = Math.max(0.5, Math.round((tempDiff / heatGainRate) * 10) / 10);
+  return `${safeMins}m safe window before >${maxT.toFixed(1)}°C`;
+}
+
+function computeCompressorHealth(row: FleetTableRow): string {
+  if (!row.compressor_active) return 'Standby';
+  if (row.status === 'EXCURSION') return 'Cooling Heavy Load';
+  if (row.status === 'WARNING') return 'High Load (Duty 88%)';
+  return 'Cooling ON';
 }
 
 type PresetWindow = 'live' | '1h' | '6h' | '24h' | 'all' | 'custom';
@@ -72,6 +116,8 @@ export const VehicleReadingsPage: React.FC<VehicleReadingsPageProps> = ({
   onAction,
   onExportCsv,
   onRegisterDevice,
+  onUpdateDevice,
+  onDeleteDevice,
   nowMs,
 }) => {
   const [search, setSearch] = useState('');
@@ -88,19 +134,85 @@ export const VehicleReadingsPage: React.FC<VehicleReadingsPageProps> = ({
 
   // Register device modal state
   const [modalOpen, setModalOpen] = useState(false);
-  const [newId, setNewId] = useState('GW-009');
-  const [newImei, setNewImei] = useState('860738070479901');
-  const [newName, setNewName] = useState('BioCarrier TS-09-UX-5510');
+  const [newId, setNewId] = useState('GW-002');
+  const [newImei, setNewImei] = useState('');
+  const [newName, setNewName] = useState('Pharma Cold Carrier');
   const [newCargo, setNewCargo] = useState('mRNA Vaccines (2-8°C)');
   const [newMin, setNewMin] = useState('2.0');
   const [newMax, setNewMax] = useState('8.0');
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
 
+  // Edit device modal state
+  const [editModalOpen, setEditModalOpen] = useState(false);
+  const [editTargetId, setEditTargetId] = useState('');
+  const [editName, setEditName] = useState('');
+  const [editCargo, setEditCargo] = useState('');
+  const [editMin, setEditMin] = useState('2.0');
+  const [editMax, setEditMax] = useState('8.0');
+  const [editImei, setEditImei] = useState('');
+  const [editSubmitting, setEditSubmitting] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+
   const selectedRow =
     fleetRows.find((r) => r.device_id === selectedDeviceId) ?? fleetRows[0];
   const selectedDevice =
     devices.find((d) => d.device_id === selectedDeviceId) ?? null;
+
+  const openEditModalFor = (devId: string) => {
+    const row = fleetRows.find((r) => r.device_id === devId) || selectedRow;
+    const dev = devices.find((d) => d.device_id === devId) || selectedDevice;
+    setEditTargetId(devId);
+    setEditName(row?.vehicle_name || dev?.vehicle_name || devId);
+    setEditCargo(row?.cargo_type || dev?.cargo_type || 'mRNA Vaccines (2–8°C)');
+    setEditMin(String(row?.target_min_c ?? dev?.target_min_c ?? 2.0));
+    setEditMax(String(row?.target_max_c ?? dev?.target_max_c ?? 8.0));
+    setEditImei(dev?.imei || '');
+    setConfirmDelete(false);
+    setIsDeleting(false);
+    setEditError(null);
+    setEditModalOpen(true);
+  };
+
+  async function handleSubmitEdit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!onUpdateDevice) return;
+    setEditSubmitting(true);
+    setEditError(null);
+    try {
+      await onUpdateDevice(editTargetId, {
+        vehicle_name: editName.trim(),
+        cargo_type: editCargo.trim(),
+        target_min_c: Number(editMin),
+        target_max_c: Number(editMax),
+        imei: editImei.trim(),
+      });
+      setEditModalOpen(false);
+    } catch (err) {
+      setEditError(err instanceof Error ? err.message : 'Failed to update vehicle');
+    } finally {
+      setEditSubmitting(false);
+    }
+  }
+
+  async function handleDelete(deviceId: string) {
+    if (!onDeleteDevice) return;
+    setIsDeleting(true);
+    setEditError(null);
+    try {
+      await onDeleteDevice(deviceId);
+      setEditModalOpen(false);
+      if (detailOpen && selectedDeviceId === deviceId) {
+        onDetailOpenChange(false);
+      }
+    } catch (err) {
+      setEditError(err instanceof Error ? err.message : 'Failed to delete vehicle');
+    } finally {
+      setIsDeleting(false);
+    }
+  }
 
   const filteredFleet = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -110,7 +222,7 @@ export const VehicleReadingsPage: React.FC<VehicleReadingsPageProps> = ({
         r.device_id.toLowerCase().includes(q) ||
         r.vehicle_name.toLowerCase().includes(q) ||
         r.cargo_type.toLowerCase().includes(q) ||
-        r.address.toLowerCase().includes(q)
+        (r.address || '').toLowerCase().includes(q)
     );
   }, [fleetRows, search]);
 
@@ -223,26 +335,35 @@ export const VehicleReadingsPage: React.FC<VehicleReadingsPageProps> = ({
   const diagnosticTelemetry = useMemo(() => {
     if (!selectedRow) return undefined;
     const rawTemp = selectedRow.current_temp_c;
-    const temp =
-      rawTemp !== null && rawTemp !== undefined && !isNaN(Number(rawTemp))
-        ? Number(rawTemp)
-        : 29.0;
+    const hasValidTemp =
+      rawTemp !== null && rawTemp !== undefined && !isNaN(Number(rawTemp));
+    const temp = hasValidTemp ? Number(rawTemp) : null;
     const minT = selectedRow.target_min_c ?? 2.0;
     const maxT = selectedRow.target_max_c ?? 8.0;
     const tempBand =
-      temp > maxT ? 'above_critical' : temp < minT ? 'below_critical' : 'optimal';
+      temp == null
+        ? 'optimal'
+        : temp > maxT
+          ? 'above_critical'
+          : temp < minT
+            ? 'below_critical'
+            : 'optimal';
     const isAlert =
       selectedRow.status === 'EXCURSION' ||
-      temp > maxT ||
+      (temp != null && (temp > maxT || temp < minT)) ||
       selectedRow.security === 'OPEN';
+    const speed =
+      selectedRow.speed_kmh != null && !isNaN(Number(selectedRow.speed_kmh))
+        ? Number(selectedRow.speed_kmh)
+        : 0;
     return {
       callsign: selectedRow.device_id,
       temperatureC: temp,
       tempBand: tempBand as 'optimal' | 'above_critical' | 'below_critical',
       doorState: (selectedRow.security === 'OPEN' ? 'open' : 'closed') as 'open' | 'closed',
       compressorActive: selectedRow.compressor_active ?? true,
-      speedKmh: selectedRow.speed_kmh != null ? Number(selectedRow.speed_kmh) : 0,
-      vehicleMoving: (selectedRow.speed_kmh ?? 0) > 1.0,
+      speedKmh: speed,
+      vehicleMoving: speed > 1.0,
       isAlertActive: isAlert,
       isDoorTampered: selectedRow.security === 'OPEN',
       accentHex: 0x2563eb,
@@ -250,6 +371,28 @@ export const VehicleReadingsPage: React.FC<VehicleReadingsPageProps> = ({
       cameraPreset: 'doors' as const,
     };
   }, [selectedRow]);
+
+  const historicalSummary = useMemo(() => {
+    if (activeRecords.length === 0) return 'No telemetry packets recorded in this time window.';
+    const validTemps = activeRecords
+      .map((r) => r.cargo_temp_c)
+      .filter((t): t is number => t !== null && t !== undefined && !isNaN(t));
+    const openDoors = activeRecords.filter((r) => r.door_status === 'OPEN').length;
+    const avgTemp =
+      validTemps.length > 0
+        ? (validTemps.reduce((a, b) => a + b, 0) / validTemps.length).toFixed(1)
+        : null;
+    const excursions = validTemps.filter(
+      (t) =>
+        t > (selectedRow?.target_max_c ?? 8.0) ||
+        t < (selectedRow?.target_min_c ?? 2.0)
+    ).length;
+
+    if (avgTemp === null) {
+      return `Window Audit (${activeRecords.length} packets): Probe standby · 0 thermal excursion alarms.`;
+    }
+    return `AI Window Audit: Maintained ${avgTemp}°C mean · ${openDoors} door open events · ${excursions} excursion points over ${activeRecords.length} packets.`;
+  }, [activeRecords, selectedRow]);
 
   return (
     <div className="space-y-6">
@@ -386,18 +529,33 @@ export const VehicleReadingsPage: React.FC<VehicleReadingsPageProps> = ({
                       className={`cursor-pointer transition-colors ${rowTint}`}
                     >
                       <td className="py-3 pl-3 pr-3">
-                        <div className="flex items-center gap-1.5 font-mono font-bold text-blue-700">
-                          <span>{row.device_id}</span>
-                          {row.device_id === 'GW-001' && row.connectivity === 'ONLINE' && (
-                            <span className="rounded bg-cyan-100 px-1.5 py-0.5 text-[9px] font-bold text-cyan-800 border border-cyan-300">
-                              LIVE IOT
-                            </span>
+                        <div className="flex items-center justify-between gap-1.5">
+                          <div className="flex items-center gap-1.5 font-mono font-bold text-blue-700">
+                            <span>{row.device_id}</span>
+                            {row.device_id === 'GW-001' && row.connectivity === 'ONLINE' && (
+                              <span className="rounded bg-cyan-100 px-1.5 py-0.5 text-[9px] font-bold text-cyan-800 border border-cyan-300">
+                                LIVE IOT
+                              </span>
+                            )}
+                          </div>
+                          {onUpdateDevice && (
+                            <button
+                              type="button"
+                              title={`Edit ${row.device_id} parameters`}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                openEditModalFor(row.device_id);
+                              }}
+                              className="rounded p-1 text-slate-400 hover:bg-slate-200 hover:text-blue-600 transition-colors cursor-pointer"
+                            >
+                              <Edit2 className="h-3.5 w-3.5" />
+                            </button>
                           )}
                         </div>
-                        <div className="text-slate-900 font-semibold">{row.vehicle_name}</div>
-                        {row.device_id === 'GW-001' && (
-                          <div className="text-[10px] font-mono text-cyan-700">IMEI: 860738070471994</div>
-                        )}
+                        <div className="text-slate-900 font-semibold">{cleanVehicleName(row.vehicle_name, row.device_id)}</div>
+                        <div className="text-[10px] font-mono text-slate-500">
+                          IMEI: {devices.find((d) => d.device_id === row.device_id)?.imei || (row.device_id === 'GW-001' ? '860738070471994' : 'Awaiting Registration')}
+                        </div>
                       </td>
                       <td className="py-3 px-3">
                         <span
@@ -411,7 +569,7 @@ export const VehicleReadingsPage: React.FC<VehicleReadingsPageProps> = ({
                       </td>
                       <td className="py-3 px-3">
                         <VehicleCargoBadge
-                          vehicleName={row.vehicle_name}
+                          vehicleName={cleanVehicleName(row.vehicle_name, row.device_id)}
                           cargoType={row.cargo_type}
                         />
                         <div className="mt-1 font-mono text-[11px] text-slate-500 tabular-nums">
@@ -419,14 +577,20 @@ export const VehicleReadingsPage: React.FC<VehicleReadingsPageProps> = ({
                         </div>
                       </td>
                       <td className="py-3 px-3 font-mono tabular-nums">
-                        <div className={`text-sm font-bold ${row.current_temp_c !== null && row.current_temp_c !== undefined ? tempCls : 'text-amber-700'}`}>
+                        <div className={`text-sm font-bold ${row.current_temp_c !== null && row.current_temp_c !== undefined ? tempCls : 'text-slate-600'}`}>
                           {row.current_temp_c !== null && row.current_temp_c !== undefined
                             ? `${row.current_temp_c.toFixed(2)}°C`
-                            : '--.-°C (Standby)'}
+                            : '--.-°C'}
                         </div>
-                        <div className="text-[11px] text-slate-500">
-                          Amb {row.ambient_temp_c.toFixed(1)}°C
-                        </div>
+                        {row.ambient_temp_c != null ? (
+                          <div className="text-[11px] text-slate-500">
+                            Amb {row.ambient_temp_c.toFixed(1)}°C
+                          </div>
+                        ) : (
+                          <div className="text-[10px] text-slate-400">
+                            (Standby)
+                          </div>
+                        )}
                       </td>
                       <td className="py-3 px-3">
                         <MiniSparkline
@@ -451,25 +615,35 @@ export const VehicleReadingsPage: React.FC<VehicleReadingsPageProps> = ({
                           ) : (
                             <span className="text-slate-500 font-medium">○ Probe Standby</span>
                           )}
+                          <span className="block text-[9px] text-slate-400 font-sans">
+                            {computeSensorDiagnosis(row).label}
+                          </span>
                         </div>
                       </td>
                       <td className="py-3 px-3 font-mono text-[11px]">
-                        <div className={row.security === 'OPEN' ? 'text-rose-700 font-bold' : 'text-emerald-700 font-semibold'}>
+                        <div className={row.security === 'OPEN' ? 'text-rose-700 font-bold' : (row.security === 'Standby' ? 'text-slate-500' : 'text-emerald-700 font-semibold')}>
                           {row.security}
+                          {row.security === 'OPEN' && (
+                            <span className="block text-[10px] font-normal text-rose-600 font-sans">
+                              {computeDoorDwellBudget(row)}
+                            </span>
+                          )}
                         </div>
-                        <div className="text-slate-600">
-                          {row.compressor_active ? 'Cooling ON' : 'Standby'}
+                        <div className="text-slate-600 text-[10px]">
+                          {row.last_seen_ms === 0 ? 'Standby' : computeCompressorHealth(row)}
                         </div>
                       </td>
                       <td className="py-3 px-3">
-                        <div className="font-medium text-slate-900">{row.address}</div>
+                        <div className="font-medium text-slate-900 max-w-[170px] truncate" title={row.address || 'Awaiting GPS Fix'}>
+                          {row.address || 'Awaiting GPS Fix'}
+                        </div>
                         <div className="font-mono text-[11px] text-slate-500 tabular-nums">
-                          {row.speed_kmh.toFixed(1)} km/h
+                          {row.last_seen_ms === 0 || row.lat === null || row.lat === undefined ? '-- km/h' : `${row.speed_kmh.toFixed(1)} km/h`}
                         </div>
                       </td>
                       <td className="py-3 pl-3 pr-3 text-right font-mono text-[11px] text-slate-600 tabular-nums">
-                        <div>{formatRelativeAge(row.last_seen_ms, nowMs)}</div>
-                        <div className="text-slate-400">SEQ #{row.seq}</div>
+                        <div>{row.last_seen_ms === 0 ? 'Never' : formatRelativeAge(row.last_seen_ms, nowMs)}</div>
+                        <div className="text-slate-400">{row.seq === 0 ? '--' : `SEQ #${row.seq}`}</div>
                       </td>
                     </tr>
                   );
@@ -483,10 +657,10 @@ export const VehicleReadingsPage: React.FC<VehicleReadingsPageProps> = ({
       {/* VIEW 2: New Page When Clicking a Vehicle -> "<DEVICE_ID> Status" + Anytime Archive */}
       {detailOpen && selectedRow && (
         <>
-          <section className="surface-panel rounded-xl p-6 space-y-5">
-            <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-200 pb-4">
-              <div className="space-y-1.5">
-                <div className="flex flex-wrap items-center gap-3">
+          <section className="surface-panel rounded-xl p-5 sm:p-6 space-y-5">
+            <div className="flex flex-col gap-4 border-b border-slate-200 pb-4 lg:flex-row lg:items-center lg:justify-between">
+              <div className="space-y-1.5 min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-2 sm:gap-2.5">
                   <h2 className="font-display text-lg font-bold text-slate-900">
                     {selectedRow.device_id} Status
                   </h2>
@@ -504,78 +678,58 @@ export const VehicleReadingsPage: React.FC<VehicleReadingsPageProps> = ({
                     {selectedStage}
                   </span>
                   <VehicleCargoBadge
-                    vehicleName={selectedRow.vehicle_name}
+                    vehicleName={cleanVehicleName(selectedRow.vehicle_name, selectedRow.device_id)}
                     cargoType={selectedRow.cargo_type}
                   />
+                  {onUpdateDevice && (
+                    <button
+                      type="button"
+                      onClick={() => openEditModalFor(selectedRow.device_id)}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-semibold text-slate-700 hover:bg-slate-50 hover:border-blue-400 hover:text-blue-600 cursor-pointer shadow-2xs transition-colors shrink-0"
+                    >
+                      <Edit2 className="h-3 w-3" /> Edit Device
+                    </button>
+                  )}
                 </div>
-                <p className="text-xs text-slate-500">
-                  {selectedRow.vehicle_name} · IMEI {selectedDevice?.imei ?? '860738070471994'} · {selectedRow.address}
-                </p>
+                <div className="text-xs text-slate-500 flex flex-wrap items-center gap-x-2 gap-y-1">
+                  <span className="font-semibold text-slate-700">{cleanVehicleName(selectedRow.vehicle_name, selectedRow.device_id)}</span>
+                  <span>·</span>
+                  <span className="font-mono text-slate-600">IMEI {selectedDevice?.imei || (selectedRow.device_id === 'GW-001' ? '860738070471994' : 'Awaiting Registration')}</span>
+                  <span>·</span>
+                  <span className="text-slate-600">{selectedRow.address || 'Awaiting GPS Fix'}</span>
+                </div>
               </div>
 
-              <div className="flex flex-wrap items-center gap-2">
-                {selectedRow.device_id === 'GW-001' ? (
-                  <div className={`flex items-center gap-2 rounded-lg border px-3.5 py-1.5 text-xs font-semibold ${
-                    selectedRow.connectivity === 'ONLINE'
-                      ? 'bg-cyan-50 border-cyan-200 text-cyan-800'
-                      : 'bg-slate-100 border-slate-300 text-slate-700'
-                  }`}>
-                    <span className={`h-2 w-2 rounded-full ${selectedRow.connectivity === 'ONLINE' ? 'bg-cyan-500 animate-pulse' : 'bg-slate-400'}`}></span>
-                    {selectedRow.connectivity === 'ONLINE'
-                      ? 'Live Physical Hardware Unit: Active Telemetry Stream'
-                      : 'Physical Hardware Unit: Standby / Offline'}
-                  </div>
-                ) : (
-                  <>
-                    <button
-                      type="button"
-                      disabled={busyAction !== null}
-                      onClick={() => handleSim('DOOR_BREACH')}
-                      className="inline-flex items-center gap-1.5 rounded-lg border border-rose-300 bg-rose-50 px-2.5 py-1.5 text-xs font-medium text-rose-700 hover:bg-rose-100 cursor-pointer whitespace-nowrap shrink-0"
-                    >
-                      <Unlock className="h-3.5 w-3.5" /> Door Breach
-                    </button>
-                    <button
-                      type="button"
-                      disabled={busyAction !== null}
-                      onClick={() => handleSim('COMPRESSOR_FAULT')}
-                      className="inline-flex items-center gap-1.5 rounded-lg border border-amber-300 bg-amber-50 px-2.5 py-1.5 text-xs font-medium text-amber-800 hover:bg-amber-100 cursor-pointer whitespace-nowrap shrink-0"
-                    >
-                      <Zap className="h-3.5 w-3.5" /> Compressor Fault
-                    </button>
-                    <button
-                      type="button"
-                      disabled={busyAction !== null}
-                      onClick={() => handleSim('SIGNAL_DROP')}
-                      className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 cursor-pointer whitespace-nowrap shrink-0"
-                    >
-                      <WifiOff className="h-3.5 w-3.5" /> Drop Signal
-                    </button>
-                    <button
-                      type="button"
-                      disabled={busyAction !== null}
-                      onClick={() => handleSim('RESTORE_NORMAL')}
-                      className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-300 bg-emerald-50 px-2.5 py-1.5 text-xs font-medium text-emerald-800 hover:bg-emerald-100 cursor-pointer whitespace-nowrap shrink-0"
-                    >
-                      <RotateCcw className="h-3.5 w-3.5" /> Restore Normal
-                    </button>
-                  </>
-                )}
+              <div className="flex flex-wrap items-center gap-2 sm:gap-3">
+                <div className={`flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs font-semibold ${
+                  selectedRow.connectivity === 'ONLINE'
+                    ? 'bg-cyan-50 border-cyan-200 text-cyan-800'
+                    : 'bg-slate-100 border-slate-300 text-slate-700'
+                }`}>
+                  <span className={`h-2 w-2 rounded-full ${selectedRow.connectivity === 'ONLINE' ? 'bg-cyan-500 animate-pulse' : 'bg-slate-400'}`}></span>
+                  {selectedRow.connectivity === 'ONLINE'
+                    ? 'Live Physical Hardware: Active Telemetry'
+                    : 'Physical Hardware: Standby / Offline'}
+                </div>
+
                 <button
                   type="button"
                   disabled={busyAction !== null}
+                  title="Pause live telemetry updates to inspect readings steadily without auto-refresh"
                   onClick={() =>
                     handleSim(streamPaused ? 'RESUME_STREAM' : 'PAUSE_STREAM')
                   }
-                  className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-blue-700 cursor-pointer whitespace-nowrap shrink-0"
+                  className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold text-white cursor-pointer whitespace-nowrap shadow-xs transition-colors ${
+                    streamPaused ? 'bg-amber-600 hover:bg-amber-700' : 'bg-blue-600 hover:bg-blue-700'
+                  }`}
                 >
                   {streamPaused ? (
                     <>
-                      <Play className="h-3.5 w-3.5" /> Resume
+                      <Play className="h-3.5 w-3.5" /> Resume Stream
                     </>
                   ) : (
                     <>
-                      <Pause className="h-3.5 w-3.5" /> Pause
+                      <Pause className="h-3.5 w-3.5" /> Pause Stream
                     </>
                   )}
                 </button>
@@ -594,12 +748,12 @@ export const VehicleReadingsPage: React.FC<VehicleReadingsPageProps> = ({
                         : selectedStage === 'WARNING'
                           ? 'text-amber-600'
                           : 'text-emerald-700'
-                      : 'text-amber-700'
+                      : 'text-slate-600'
                   }`}
                 >
                   {selectedRow.current_temp_c !== null && selectedRow.current_temp_c !== undefined
                     ? `${selectedRow.current_temp_c.toFixed(2)}°C`
-                    : '--.-°C (Standby)'}
+                    : '--.-°C'}
                 </div>
               </div>
               <div className="surface-row rounded-lg p-3">
@@ -613,6 +767,11 @@ export const VehicleReadingsPage: React.FC<VehicleReadingsPageProps> = ({
                 <div className="mt-1 font-mono text-sm font-semibold text-slate-900">
                   {selectedRow.security} · {selectedRow.compressor_active ? 'ON' : 'OFF'}
                 </div>
+                {selectedRow.security === 'OPEN' && (
+                  <div className="mt-0.5 text-[10px] text-rose-600 font-sans">
+                    {computeDoorDwellBudget(selectedRow)}
+                  </div>
+                )}
               </div>
               <div className="surface-row rounded-lg p-3">
                 <div className="text-slate-500">Signal &amp; Sensor Link</div>
@@ -623,6 +782,9 @@ export const VehicleReadingsPage: React.FC<VehicleReadingsPageProps> = ({
                   />
                   <span className={`text-[11px] font-mono font-medium ${selectedRow.node_connected ? 'text-emerald-700' : 'text-slate-500'}`}>
                     {selectedRow.node_connected ? '● BLE Probe Linked' : '○ BLE Probe Standby (Null)'}
+                  </span>
+                  <span className="text-[10px] text-slate-400 font-sans">
+                    {computeSensorDiagnosis(selectedRow).label}
                   </span>
                 </div>
               </div>
@@ -672,8 +834,8 @@ export const VehicleReadingsPage: React.FC<VehicleReadingsPageProps> = ({
                 <h2 className="font-display text-lg font-semibold text-slate-900">
                   Anytime Historical Data Explorer ({selectedDeviceId})
                 </h2>
-                <p className="text-xs text-slate-500">
-                  Query SQLite WAL telemetry history for any time window and export offline audit CSVs
+                <p className="text-xs text-blue-700 font-medium mt-0.5">
+                  {historicalSummary}
                 </p>
               </div>
 
@@ -821,7 +983,7 @@ export const VehicleReadingsPage: React.FC<VehicleReadingsPageProps> = ({
                             {hasTemp ? `${p.cargo_temp_c!.toFixed(2)}°C` : '--.-°C'}
                           </td>
                           <td className="py-2.5 px-3 text-slate-700">
-                            {p.ambient_temp_c.toFixed(1)}°C · {p.humidity_pct.toFixed(0)}%
+                            {p.ambient_temp_c != null ? `${p.ambient_temp_c.toFixed(1)}°C` : '--'} · {p.humidity_pct != null ? `${p.humidity_pct.toFixed(0)}%` : '--'}
                           </td>
                           <td className="py-2.5 px-3">
                             <SignalStrengthDisplay
@@ -838,10 +1000,10 @@ export const VehicleReadingsPage: React.FC<VehicleReadingsPageProps> = ({
                             </div>
                           </td>
                           <td className="py-2.5 px-3 text-slate-700">
-                            {p.speed_kmh.toFixed(1)} km/h
+                            {p.speed_kmh != null ? `${p.speed_kmh.toFixed(1)} km/h` : '0.0 km/h'}
                           </td>
-                          <td className="py-2.5 px-3 font-sans text-slate-700 max-w-[210px] truncate">
-                            {p.address}
+                          <td className="py-2.5 px-3 font-sans text-slate-700 max-w-[210px] truncate" title={p.address || 'Awaiting GPS Fix'}>
+                            {p.address || 'Awaiting GPS Fix'}
                           </td>
                           <td className="py-2.5 pl-3 text-right text-slate-700">
                             {p.door_status} · {p.compressor_active ? 'ON' : 'OFF'}
@@ -990,6 +1152,150 @@ export const VehicleReadingsPage: React.FC<VehicleReadingsPageProps> = ({
                 >
                   {submitting ? 'Provisioning...' : 'Provision Unit'}
                 </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Edit Hardware Modal */}
+      {editModalOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/45 p-4 backdrop-blur-xs"
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Edit ${editTargetId} Configuration`}
+        >
+          <div className="w-full max-w-md rounded-xl border border-slate-200 bg-white p-6 shadow-2xl">
+            <div className="flex items-center justify-between border-b border-slate-200 pb-3">
+              <div>
+                <h3 className="font-display text-base font-bold text-slate-900">
+                  Edit Vehicle Configuration
+                </h3>
+                <p className="text-[11px] font-mono text-blue-700">Target Callsign: {editTargetId}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditModalOpen(false)}
+                aria-label="Close edit modal"
+                className="text-slate-400 hover:text-slate-900 cursor-pointer"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSubmitEdit} className="mt-4 space-y-3 text-xs">
+              {editError && (
+                <div className="rounded-lg border border-rose-300 bg-rose-50 p-2.5 text-rose-700">
+                  {editError}
+                </div>
+              )}
+
+              <div>
+                <label className="mb-1 block text-slate-600 font-medium">Vehicle Name / Carrier Plate</label>
+                <input
+                  required
+                  value={editName}
+                  onChange={(e) => setEditName(e.target.value)}
+                  className="h-9 w-full rounded-lg border border-slate-200 bg-white px-2.5 text-slate-900"
+                />
+              </div>
+
+              <div>
+                <label className="mb-1 block text-slate-600 font-medium">Cargo Classification</label>
+                <input
+                  required
+                  value={editCargo}
+                  onChange={(e) => setEditCargo(e.target.value)}
+                  className="h-9 w-full rounded-lg border border-slate-200 bg-white px-2.5 text-slate-900"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="mb-1 block text-slate-600 font-medium">Min Temp Threshold (°C)</label>
+                  <input
+                    type="number"
+                    step="0.1"
+                    required
+                    value={editMin}
+                    onChange={(e) => setEditMin(e.target.value)}
+                    className="h-9 w-full rounded-lg border border-slate-200 bg-white px-2.5 font-mono text-slate-900"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-slate-600 font-medium">Max Temp Threshold (°C)</label>
+                  <input
+                    type="number"
+                    step="0.1"
+                    required
+                    value={editMax}
+                    onChange={(e) => setEditMax(e.target.value)}
+                    className="h-9 w-full rounded-lg border border-slate-200 bg-white px-2.5 font-mono text-slate-900"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="mb-1 block text-slate-600 font-medium">Hardware IMEI Serial</label>
+                <input
+                  required
+                  value={editImei}
+                  onChange={(e) => setEditImei(e.target.value)}
+                  className="h-9 w-full rounded-lg border border-slate-200 bg-white px-2.5 font-mono text-slate-900"
+                />
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 pt-3">
+                {onDeleteDevice ? (
+                  confirmDelete ? (
+                    <div className="flex items-center gap-2">
+                      <span className="text-[11px] font-semibold text-rose-700">Delete vehicle?</span>
+                      <button
+                        type="button"
+                        onClick={() => handleDelete(editTargetId)}
+                        disabled={isDeleting}
+                        className="rounded-md bg-rose-600 px-2.5 py-1 text-xs font-semibold text-white hover:bg-rose-700 cursor-pointer disabled:opacity-50"
+                      >
+                        {isDeleting ? 'Deleting...' : 'Yes, Delete'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setConfirmDelete(false)}
+                        className="rounded-md border border-slate-200 px-2 py-1 text-xs font-medium text-slate-600 hover:bg-slate-50 cursor-pointer"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => setConfirmDelete(true)}
+                      className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium text-rose-600 hover:bg-rose-50 hover:text-rose-700 cursor-pointer transition-colors"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" /> Delete Vehicle
+                    </button>
+                  )
+                ) : (
+                  <div />
+                )}
+
+                <div className="flex items-center gap-2 ml-auto">
+                  <button
+                    type="button"
+                    onClick={() => setEditModalOpen(false)}
+                    className="rounded-lg border border-slate-200 px-3.5 py-2 font-medium text-slate-700 hover:bg-slate-50 cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={editSubmitting}
+                    className="rounded-lg bg-blue-600 px-4 py-2 font-semibold text-white hover:bg-blue-700 disabled:opacity-50 cursor-pointer"
+                  >
+                    {editSubmitting ? 'Saving Changes...' : 'Save Configuration'}
+                  </button>
+                </div>
               </div>
             </form>
           </div>

@@ -19,7 +19,7 @@ export type CameraPresetId = 'overview' | 'node' | 'cabin' | 'doors';
 export interface SceneVisualState {
   callsign: string;
   accentHex: number;
-  temperatureC: number;
+  temperatureC: number | null;
   tempBand: TemperatureBand;
   doorState: DoorState;
   compressorActive: boolean;
@@ -149,7 +149,7 @@ export class ColdChainTruckScene {
   private gatewayBeaconMat!: THREE.MeshStandardMaterial;
   private doorSensorLedMat!: THREE.MeshStandardMaterial;
   private gatewayScreen!: ReturnType<typeof createGatewayScreenTexture>;
-  private lastDrawnTemp = NaN;
+  private lastDrawnTemp: number | null = NaN;
   private lastDrawnCritical = false;
   private lastDrawnTampered = false;
   private lastDrawnCallsign = '';
@@ -1922,7 +1922,7 @@ export class ColdChainTruckScene {
     }
 
     if (this.renderer?.domElement) {
-      const tStr = Number.isFinite(s.temperatureC) ? `${s.temperatureC.toFixed(1)}°C` : 'Standby';
+      const tStr = s.temperatureC != null && Number.isFinite(s.temperatureC) ? `${s.temperatureC.toFixed(1)}°C` : 'Standby';
       const movingStr = s.vehicleMoving ? `moving at ${Math.round(s.speedKmh)} km/h` : 'parked';
       const doorStr = isDoorOpen ? 'doors open' : 'doors sealed';
       const alertStr = s.isAlertActive ? 'EXCURSION ALERT' : 'Normal GDP';
@@ -1950,7 +1950,7 @@ export class ColdChainTruckScene {
       this.rfPulseMat.color.setHex(0x38bdf8);
     }
 
-    const roundedTemp = Number(s.temperatureC.toFixed(1));
+    const roundedTemp = s.temperatureC != null && Number.isFinite(s.temperatureC) ? Number(s.temperatureC.toFixed(1)) : null;
     if (
       roundedTemp !== this.lastDrawnTemp ||
       s.isAlertActive !== this.lastDrawnCritical ||
